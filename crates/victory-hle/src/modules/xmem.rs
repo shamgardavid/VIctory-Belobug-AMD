@@ -821,6 +821,11 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    // No bytes: nothing to map or refuse (an empty range at the start of a
+    // reservation shown whole would otherwise count as inside it).
+    if len == 0 {
+        return true;
+    }
     let mut physical = physical();
     if in_whole(&physical, to, len) {
         tracing::warn!(to = format_args!("{to:#x}"), len, "page mappings into a reservation shown whole");
@@ -1287,10 +1292,12 @@ mod tests {
 
     #[test]
     fn physical_pages_map_alias_and_unmap() {
-        let mut pages = [0usize; 3];
-        let mut n = 3;
+        // One page more than the reservations hold, so the mapping goes page
+        // by page and is not shown whole (`a_reservation_is_shown_whole`).
+        let mut pages = [0usize; 4];
+        let mut n = 4;
         assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
-        assert_eq!(n, 3);
+        assert_eq!(n, 4);
         // Packed into 21 bits as `number >> 4`, as the title keeps them.
         for p in pages {
             assert_eq!((p >> 4 & 0x1f_ffff) << 4, p);
@@ -1358,13 +1365,14 @@ mod tests {
         assert!(map_alias(b as u64, 0, PAGE as u64));
         assert_eq!(query(b).host.State, MEM_RESERVE);
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
-        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
     }
 
     #[test]
     fn mapping_no_pages_changes_nothing() {
-        let pages = allocate(2);
+        // One page more than the reservation: mapped page by page.
+        let pages = allocate(3);
         let a = XMemVirtualAlloc(
             std::ptr::null_mut(),
             2 * PAGE,
@@ -1400,7 +1408,7 @@ mod tests {
         assert_eq!(query(second).host.State, MEM_RESERVE);
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
-        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     /// `n` pages of one new allocation.
@@ -1490,11 +1498,14 @@ mod tests {
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
     }
 
-    /// `n` physical pages (consecutive slices of one section) and a
-    /// reservation of `n` 64 KiB pages for them.
+    /// `n + 1` physical pages (consecutive slices of one section) and a
+    /// reservation of `n` 64 KiB pages for the first `n`. The section is one
+    /// page longer than the reservation, so mappings into it go page by page
+    /// (`map_whole` shows a reservation whole only when it is as long as the
+    /// section of its pages; `a_reservation_is_shown_whole` tests that).
     fn pages_and_reservation(n: usize) -> (Vec<usize>, *mut c_void) {
-        let mut pages = vec![0usize; n];
-        let mut count = n;
+        let mut pages = vec![0usize; n + 1];
+        let mut count = n + 1;
         assert_eq!(
             XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()),
             1
@@ -1535,7 +1546,7 @@ mod tests {
         }
         assert_eq!(XMemMapPhysicalPages(a, 3, std::ptr::null()), a);
         assert_eq!(query(a).host.State, MEM_RESERVE);
-        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     /// A run that starts inside one host placeholder and ends inside the
@@ -1563,7 +1574,7 @@ mod tests {
             assert_eq!(at(3).cast::<u8>().read(), 42);
         }
         assert_eq!(XMemMapPhysicalPages(a, 4, std::ptr::null()), a);
-        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     /// Placeholders a run spans are never joined: a piece the title split
@@ -1582,7 +1593,7 @@ mod tests {
         assert_eq!((info.AllocationBase, info.RegionSize), (at(2), 2 * PAGE));
         // SAFETY: the title's own piece, unmapped.
         assert_ne!(unsafe { VirtualFree(at(2), 0, MEM_RELEASE) }, 0);
-        assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
     }
 
     /// A run whose second part is no placeholder (memory committed in place
@@ -1620,6 +1631,55 @@ mod tests {
         // Page 0 is a placeholder again: it takes a mapping.
         assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(pages.len(), pages.as_ptr()), 1);
+    }
+
+    /// A reservation as long as the section of the pages mapped into it is
+    /// shown whole by one view, however many calls map it (Grand Theft Auto
+    /// VI maps its GPU heap in three): a page goes where the title first
+    /// puts it, unmapping leaves the view in place, and the GPU's
+    /// page-mapping copies do not reach into it.
+    #[test]
+    fn a_reservation_is_shown_whole() {
+        let pages = allocate(3);
+        let a = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            3 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!a.is_null());
+        let at = |page: usize| a.wrapping_byte_add(page * PAGE);
+        // Page 0 first, then pages 2 and 1 in each other's places.
+        assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
+        assert_eq!(XMemMapPhysicalPages(at(1), 1, pages[2..].as_ptr()), at(1));
+        assert_eq!(XMemMapPhysicalPages(at(2), 1, pages[1..].as_ptr()), at(2));
+        {
+            let physical = physical();
+            let view = physical.views.get(&(a as usize)).map(|v| v.0);
+            assert_eq!(view, Some(3 * PAGE), "one view of the whole reservation");
+            assert!(in_whole(&physical, a as usize, 3 * PAGE));
+        }
+        for page in 0..3 {
+            assert_eq!(query(at(page)).host.State, MEM_COMMIT, "page {page}");
+            // SAFETY: mapped read-write.
+            unsafe { at(page).cast::<u8>().write(20 + page as u8) };
+        }
+        // Each page holds what was written where the title put it.
+        assert_eq!(page_bytes(pages[0])[0], 20);
+        assert_eq!(page_bytes(pages[2])[0], 21);
+        assert_eq!(page_bytes(pages[1])[0], 22);
+
+        // Unmapping a page of it leaves it shown.
+        assert_eq!(XMemMapPhysicalPages(at(1), 1, std::ptr::null()), at(1));
+        assert_eq!(query(at(1)).host.State, MEM_COMMIT);
+        // SAFETY: still mapped.
+        assert_eq!(unsafe { at(1).cast::<u8>().read() }, 21);
+        // The GPU's page-mapping copies are refused there, but a copy of
+        // no bytes changes nothing anywhere.
+        assert!(!map_alias(at(1) as u64, a as u64, PAGE as u64));
+        assert!(map_alias(at(1) as u64, a as u64, 0));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }
