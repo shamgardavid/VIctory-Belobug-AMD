@@ -1150,8 +1150,8 @@ mod host {
         empty_until: [Option<Instant>; PADS],
     }
 
-    impl Source for Host {
-        fn pad(&mut self, slot: usize) -> Option<PadState> {
+    impl Host {
+        fn read_pad(&mut self, slot: usize) -> Option<PadState> {
             let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
             if !empty {
                 let mut state = XINPUT_STATE::default();
@@ -1178,6 +1178,21 @@ mod host {
                 });
             }
             None
+        }
+    }
+
+    impl Source for Host {
+        /// A pad stays connected while another program has focus, but at
+        /// rest there, so a game played meanwhile does not drive the title.
+        /// `VICTORY_NO_PADS=1` leaves host pads out, the keyboard's stand-in
+        /// being the title's pad.
+        fn pad(&mut self, slot: usize) -> Option<PadState> {
+            static NO_PADS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *NO_PADS.get_or_init(|| std::env::var_os("VICTORY_NO_PADS").is_some()) {
+                return None;
+            }
+            let state = self.read_pad(slot)?;
+            Some(if focused() { state } else { PadState::default() })
         }
 
         fn keys(&mut self) -> Vec<KeyState> {

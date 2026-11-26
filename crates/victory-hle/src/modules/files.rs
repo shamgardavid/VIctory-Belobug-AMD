@@ -658,7 +658,17 @@ pub extern "system" fn ReadFile(
     let read_file = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
     let header = header_of(file);
     if header == 0 {
-        return read_file(file, buffer, len, read, overlapped);
+        let ok = read_file(file, buffer, len, read, overlapped);
+        // SAFETY: the host wrote the count, when there is one.
+        #[cfg(feature = "diagnostics")]
+        if ok != 0 && len > 0 && !read.is_null() && unsafe { *read } == 0 {
+            past_end(file, overlapped, len);
+        }
+        #[cfg(feature = "diagnostics")]
+        if ok == 0 {
+            failed_read(file, buffer, len);
+        }
+        return ok;
     }
     tracing::debug!(len, overlapped = !overlapped.is_null(), "read of a wrapped archive");
     let mut got = 0;
@@ -700,6 +710,83 @@ pub extern "system" fn ReadFile(
         unsafe { *read = got };
     }
     ok
+}
+
+/// Diagnostics: a title read that got no bytes (at or past the end), with
+/// its file, offset and the file's size; the first ten, then every 1000th.
+#[cfg(feature = "diagnostics")]
+fn past_end(file: Handle, overlapped: *mut c_void, len: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let n = SEEN.fetch_add(1, Ordering::Relaxed);
+    if n >= 10 && n % 1000 != 0 {
+        return;
+    }
+    let offset = if overlapped.is_null() {
+        let mut at = 0;
+        host!("kernel32.dll", "SetFilePointerEx": extern "system" fn(Handle, i64, *mut i64, u32) -> i32)(
+            file, 0, &mut at, FILE_CURRENT,
+        );
+        at as u64
+    } else {
+        // SAFETY: the title's OVERLAPPED; Offset and OffsetHigh at byte 16.
+        unsafe { overlapped.cast::<u8>().add(16).cast::<u64>().read_unaligned() }
+    };
+    let mut size = 0i64;
+    host!("kernel32.dll", "GetFileSizeEx": extern "system" fn(Handle, *mut i64) -> i32)(file, &mut size);
+    let mut path = [0u16; 512];
+    // SAFETY: room for 512 characters.
+    let used = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(file, path.as_mut_ptr(), 512, 0)
+    } as usize;
+    tracing::warn!(
+        n,
+        path = String::from_utf16_lossy(&path[..used.min(512)]),
+        offset,
+        len,
+        size,
+        from = super::kernel::callers(),
+        "a title read got no bytes"
+    );
+}
+
+/// Diagnostics: a title read that failed, with its file and error; the first
+/// five, then every 500th, since a title may retry one forever.
+#[cfg(feature = "diagnostics")]
+fn failed_read(file: Handle, buffer: *mut u8, len: u32) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // SAFETY: plain host calls.
+    let error = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+    if error == 997 {
+        return; // ERROR_IO_PENDING: not a failure
+    }
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    let n = FAILED.fetch_add(1, Ordering::Relaxed);
+    if n >= 5 && n % 500 != 0 {
+        return;
+    }
+    let mut path = [0u16; 512];
+    // SAFETY: room for 512 characters.
+    let used = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(
+            file,
+            path.as_mut_ptr(),
+            path.len() as u32,
+            0,
+        )
+    } as usize;
+    let path = String::from_utf16_lossy(&path[..used.min(path.len())]);
+    tracing::warn!(
+        n,
+        error,
+        path,
+        len,
+        buffer = format_args!("{:#x}", buffer as usize),
+        from = super::kernel::callers(),
+        "a title read failed"
+    );
+    // SAFETY: plain host call; the title sees the error it would have.
+    unsafe { windows_sys::Win32::Foundation::SetLastError(error) };
 }
 
 /// After a read of a wrapped archive that came back short: zeros for what
