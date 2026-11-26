@@ -668,6 +668,7 @@ extern "system" fn initialize_async(
     } else {
         Provider::open(&saves, text(config).as_deref()).map(|p| xasync::bytes(give(p)))
     };
+    tracing::debug!(saves = %saves.display(), ok = result.is_ok(), "game save: provider");
     xasync::finished_with(block, (&raw const INIT).cast(), result)
 }
 extern "system" fn initialize_result(
@@ -755,6 +756,7 @@ extern "system" fn create_container(
     let (Some(p), Some(name)) = (get(provider), text(name)) else {
         return E_INVALIDARG;
     };
+    tracing::debug!(name, valid = valid_container(&name), "game save: container");
     if !valid_container(&name) {
         return INVALID_CONTAINER_NAME;
     }
@@ -832,6 +834,7 @@ extern "system" fn read_async(
         Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
         None => Err(E_INVALIDARG),
     };
+    tracing::debug!(count, result = ?result.as_ref().map(Vec::len).map_err(|e| format!("{e:#x}")), "game save: read");
     xasync::finished_with(block, (&raw const READ).cast(), result)
 }
 extern "system" fn read_result(
@@ -933,6 +936,12 @@ extern "system" fn delete_blob(_: This, update: *mut Update, name: *const c_char
 
 extern "system" fn submit_async(_: This, update: *const Update, block: *mut AsyncBlock) -> HRESULT {
     let hr = get(update).map_or(E_INVALIDARG, Update::submit);
+    tracing::debug!(
+        container = get(update).map(|u| u.name.clone()).unwrap_or_default(),
+        blobs = get(update).map_or(0, |u| u.changes.len()),
+        hr = format_args!("{hr:#x}"),
+        "game save: submit"
+    );
     xasync::finished(block, (&raw const SUBMIT).cast(), hr)
 }
 extern "system" fn submit_result(_: This, block: *mut AsyncBlock) -> HRESULT {
