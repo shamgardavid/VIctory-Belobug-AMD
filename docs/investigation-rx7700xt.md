@@ -75,6 +75,28 @@ Kept up to date during the investigation. Newest findings at the end of each sec
   10 s), XAsync (nothing pending), package chunks (all "installed"), Windows locale
   (en-US), monitor/pads.
 
+## ROOT CAUSE (2026-11-26, ~03:45): navmeshes.rpf is cut short
+
+- Following the loop down: `+0x1330b60` (raw compressed read) → plain path
+  `+0x1330c10` → `reader->vt[0x60]` = `+0xcdd930`, which returns 0 when the file
+  object is -1 or **when the offset is at or past the file object's size**.
+  The inflate loop in `+0x13308e0` then never ends (input stays empty, no error).
+- `VICTORY_STACK_REGS=+0x133096e` with `VICTORY_STACK_PEEK=rbx+8>0,rbx+8>0x18,…`
+  (rbx = the codec provider, [rbx+8] = the archive's storage object) shows:
+  storage `+0x28` = archive size `0x45ce0000`; part table `+0x50` = null, so the
+  default file `+0x18` is used; that file object's size `+8` = `0x45ce0000`.
+  That is exactly the size of our `navmeshes.rpf` (1,171,128,320 bytes).
+- So the table of contents of navmeshes.rpf places `navmeshes_swaps.zmt` (204,848
+  compressed bytes) past the end of the file we have: **the copy is truncated**.
+  `0x45ce0000` is an exact multiple of 64 KiB; no complete archive here is.
+- Only one other file has a 64 KiB-multiple size: `data\ttdb\peds\decorations_1_3.ttpf`
+  (`0x1e660000`) — suspicious, recopy it too.
+- Fix: copy `navmeshes.rpf` (and `decorations_1_3.ttpf`) from the Xbox again and check
+  the new size is larger and not a multiple of 64 KiB. No emulator change can supply
+  the missing data.
+- Also done: `pack\story000\story000.rpf` in the (fixed) folder is now the plain
+  archive (wrapped header stripped); the wrapped original stays in the original folder.
+
 ## Leads
 
 - Marvisak/VIctory#1063: same loader; on GTX 1660 it stops at `+0x1330a44` (codec
