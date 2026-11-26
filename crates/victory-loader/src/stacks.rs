@@ -19,7 +19,7 @@ use windows_sys::Win32::System::Threading::{
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_into};
+use crate::crash::{MAX_FRAMES, locate, unwind_each, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
@@ -124,9 +124,127 @@ pub fn dump_stacks() {
         for (i, pc) in frames.into_iter().enumerate() {
             eprintln!("    #{i:<2} {}", locate(pc as usize));
         }
+        registers_at(thread);
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };
     }
+}
+
+/// `VICTORY_STACK_REGS=<return address as module+rva>`: for a thread whose
+/// stack passes through it, the registers a callee preserves as they are in
+/// that frame, and the first 64 bytes each one points to (an object's
+/// fields; its first word located, which names a vtable's module and rva).
+fn registers_at(thread: HANDLE) {
+    let Ok(wanted) = std::env::var("VICTORY_STACK_REGS") else {
+        return;
+    };
+    let mut info: BasicInfo = BasicInfo {
+        exit_status: 0,
+        teb: std::ptr::null(),
+        client_id: [0; 2],
+        affinity: 0,
+        priority: 0,
+        base_priority: 0,
+    };
+    // SAFETY: as in `frames_of`.
+    let status = unsafe {
+        NtQueryInformationThread(
+            thread,
+            ThreadBasicInformation,
+            (&raw mut info).cast(),
+            size_of::<BasicInfo>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 || info.teb.is_null() {
+        return;
+    }
+    // SAFETY: as in `frames_of`.
+    let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
+    // Contexts are kept without allocating while the thread is suspended.
+    let mut kept: Vec<CONTEXT> = Vec::with_capacity(MAX_FRAMES);
+    // SAFETY: zeroed is a valid CONTEXT.
+    let mut context = Aligned(unsafe { std::mem::zeroed() });
+    context.0.ContextFlags = CONTEXT_FULL_AMD64;
+    // SAFETY: as in `frames_of`.
+    unsafe {
+        if SuspendThread(thread) == u32::MAX {
+            return;
+        }
+        if GetThreadContext(thread, &mut context.0) != 0 {
+            unwind_each(context.0, low, high, |c| {
+                kept.push(*c);
+                kept.len() < MAX_FRAMES
+            });
+        }
+        ResumeThread(thread);
+    }
+    for c in kept.iter().filter(|c| locate(c.Rip as usize) .ends_with(wanted.trim())) {
+        eprintln!("    registers at {}:", locate(c.Rip as usize));
+        let regs = [
+            ("rbx", c.Rbx),
+            ("rbp", c.Rbp),
+            ("rsi", c.Rsi),
+            ("rdi", c.Rdi),
+            ("r12", c.R12),
+            ("r13", c.R13),
+            ("r14", c.R14),
+            ("r15", c.R15),
+            ("rsp", c.Rsp),
+        ];
+        for (name, value) in regs {
+            eprintln!("      {name} {value:#x}{}", peek(value as usize));
+        }
+    }
+}
+
+/// The 64 bytes at `at` as eight words, the first located, or nothing if
+/// they cannot be read; then the same one level down, through the first
+/// word (an object's own first word: its vtable).
+fn peek(at: usize) -> String {
+    let here = peek_one(at);
+    let first = read_word(at);
+    match first.map(|w| peek_one(w as usize)) {
+        Some(down) if !down.is_empty() => format!("{here}\n          [0] {down}"),
+        _ => here,
+    }
+}
+
+fn read_word(at: usize) -> Option<u64> {
+    let mut word = 0u64;
+    let mut read = 0;
+    // SAFETY: as in `peek_one`.
+    let ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            at as *const c_void,
+            (&raw mut word).cast(),
+            8,
+            &mut read,
+        )
+    };
+    (ok != 0 && read == 8).then_some(word)
+}
+
+fn peek_one(at: usize) -> String {
+    let mut words = [0u64; 8];
+    let mut read = 0;
+    // SAFETY: reads our own process's memory into `words`; a bad address
+    // fails the call instead of faulting.
+    let ok = unsafe {
+        windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            at as *const c_void,
+            words.as_mut_ptr().cast(),
+            size_of_val(&words),
+            &mut read,
+        )
+    };
+    if ok == 0 || read != size_of_val(&words) {
+        return String::new();
+    }
+    let rest: Vec<String> = words.iter().map(|w| format!("{w:#x}")).collect();
+    format!("  -> [{}] {}", locate(words[0] as usize), rest.join(" "))
 }
 
 /// The thread's frames and its current and base scheduling priority (0-31).
