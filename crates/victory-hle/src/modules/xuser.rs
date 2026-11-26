@@ -90,10 +90,13 @@ pub const INTERFACES: &[Interface] = &[
 
 type This = *const Object;
 extern "system" fn duplicate(_: This, _: Handle, out: *mut Handle) -> HRESULT {
+    tracing::trace!("xuser: duplicate");
     put(out, user())
 }
 extern "system" fn close(_: This, _: Handle) {}
 extern "system" fn compare(_: This, a: Handle, b: Handle) -> i32 {
+    tracing::trace!("xuser: compare");
+    tracing::trace!("xuser: close");
     i32::from(a != b)
 }
 
@@ -117,6 +120,7 @@ static ADD: u8 = 0;
 
 /// Any options add the one user, silently.
 extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> HRESULT {
+    tracing::trace!("xuser: add_async");
     tracing::info!(options, "XUserAddAsync: the offline local user");
     xasync::XAsyncBegin(
         block,
@@ -127,6 +131,7 @@ extern "system" fn add_async(_: This, options: u32, block: *mut AsyncBlock) -> H
     )
 }
 extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle) -> HRESULT {
+    tracing::trace!("xuser: add_result");
     xasync::XAsyncGetResult(
         block,
         (&raw const ADD).cast(),
@@ -136,22 +141,28 @@ extern "system" fn add_result(_: This, block: *mut AsyncBlock, out: *mut Handle)
     )
 }
 extern "system" fn get_local_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
+    tracing::trace!("xuser: get_local_id");
     put(out, LOCAL_ID)
 }
 extern "system" fn find_by_local_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
+    tracing::trace!("xuser: find_by_local_id");
     found(id == LOCAL_ID, out)
 }
 extern "system" fn get_id(_: This, _: Handle, out: *mut u64) -> HRESULT {
+    tracing::trace!("xuser: get_id");
     put(out, XUID)
 }
 extern "system" fn find_by_id(_: This, id: u64, out: *mut Handle) -> HRESULT {
+    tracing::trace!("xuser: find_by_id");
     found(id == XUID, out)
 }
 extern "system" fn get_is_guest(_: This, _: Handle, out: *mut bool) -> HRESULT {
+    tracing::trace!("xuser: get_is_guest");
     put(out, false)
 }
 /// 0: signed in.
 extern "system" fn get_state(_: This, _: Handle, out: *mut u32) -> HRESULT {
+    tracing::trace!("xuser: get_state");
     put(out, 0)
 }
 /// The same name for every component (classic, modern, suffix, unique).
@@ -163,6 +174,7 @@ extern "system" fn get_gamertag(
     buffer: *mut u8,
     used: *mut usize,
 ) -> HRESULT {
+    tracing::trace!("xuser: get_gamertag");
     put_string(GAMERTAG, size, buffer, used)
 }
 /// Granted; deny reason 0 (none).
@@ -174,6 +186,7 @@ extern "system" fn check_privilege(
     has: *mut bool,
     reason: *mut u32,
 ) -> HRESULT {
+    tracing::trace!("xuser: check_privilege");
     if !reason.is_null() {
         // SAFETY: checked non-null.
         unsafe { reason.write(0) };
@@ -183,6 +196,7 @@ extern "system" fn check_privilege(
 
 /// 3: adult.
 extern "system" fn get_age_group(_: This, _: Handle, out: *mut u32) -> HRESULT {
+    tracing::trace!("xuser: get_age_group");
     put(out, 3)
 }
 
@@ -197,9 +211,11 @@ extern "system" fn resolve_privilege_async(
     _privilege: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    tracing::trace!("xuser: resolve_privilege_async");
     xasync::finished(block, (&raw const RESOLVE).cast(), S_OK)
 }
 extern "system" fn resolve_privilege_result(_: This, block: *mut AsyncBlock) -> HRESULT {
+    tracing::trace!("xuser: resolve_privilege_result");
     let none = std::ptr::null_mut();
     xasync::XAsyncGetResult(block, (&raw const RESOLVE).cast(), 0, none, none.cast())
 }
@@ -220,6 +236,7 @@ extern "system" fn token_async(
     _body: *const c_void,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    tracing::trace!("xuser: token_async");
     tracing::info!(
         url = text(url).unwrap_or_default(),
         "token and signature: offline"
@@ -227,6 +244,7 @@ extern "system" fn token_async(
     xasync::finished(block, (&raw const TOKEN).cast(), FAILED_TO_GET_TOKEN)
 }
 extern "system" fn token_size(_: This, block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
+    tracing::trace!("xuser: token_size");
     xasync::XAsyncGetResultSize(block, out)
 }
 extern "system" fn token_result(
@@ -237,6 +255,7 @@ extern "system" fn token_result(
     _data: *mut *const c_void,
     used: *mut usize,
 ) -> HRESULT {
+    tracing::trace!("xuser: token_result");
     xasync::XAsyncGetResult(block, (&raw const TOKEN).cast(), size, buffer, used)
 }
 
@@ -249,14 +268,17 @@ extern "system" fn register(
     _callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    tracing::trace!("xuser: register");
     put(out, token())
 }
 extern "system" fn unregister(_: This, _token: u64, _wait: bool) -> bool {
+    tracing::trace!("xuser: unregister");
     true
 }
 
 /// No input device belongs to a user.
 extern "system" fn find_for_device(_: This, _device: *const c_void, _: *mut Handle) -> HRESULT {
+    tracing::trace!("xuser: find_for_device");
     USER_NOT_FOUND
 }
 

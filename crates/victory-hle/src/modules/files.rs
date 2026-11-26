@@ -659,6 +659,8 @@ pub extern "system" fn ReadFile(
     let header = header_of(file);
     if header == 0 {
         let ok = read_file(file, buffer, len, read, overlapped);
+        #[cfg(feature = "diagnostics")]
+        early_read(file, overlapped, read, len, ok);
         // SAFETY: the host wrote the count, when there is one.
         #[cfg(feature = "diagnostics")]
         if ok != 0 && len > 0 && !read.is_null() && unsafe { *read } == 0 {
@@ -710,6 +712,35 @@ pub extern "system" fn ReadFile(
         unsafe { *read = got };
     }
     ok
+}
+
+/// Diagnostics: the title's first 60 reads at debug, with file, offset,
+/// length asked and bytes got (a pending read shows got as pending).
+#[cfg(feature = "diagnostics")]
+fn early_read(file: Handle, overlapped: *mut c_void, read: *mut u32, len: u32, ok: i32) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) >= 60 {
+        return;
+    }
+    // SAFETY: the title's OVERLAPPED (InternalHigh at 8, offset at 16) or
+    // its count, as the host left them.
+    let (offset, got) = unsafe {
+        if overlapped.is_null() {
+            (u64::MAX, if read.is_null() { 0 } else { u64::from(*read) })
+        } else {
+            let o = overlapped.cast::<u8>();
+            (o.add(16).cast::<u64>().read_unaligned(), o.add(8).cast::<u64>().read_unaligned())
+        }
+    };
+    let mut path = [0u16; 512];
+    // SAFETY: room for 512 characters.
+    let used = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(file, path.as_mut_ptr(), 512, 0)
+    } as usize;
+    let path = String::from_utf16_lossy(&path[..used.min(512)]);
+    let name = path.rsplit('\\').next().unwrap_or_default().to_owned();
+    tracing::debug!(name, offset, len, got, ok, "title read");
 }
 
 /// Diagnostics: a title read that got no bytes (at or past the end), with
