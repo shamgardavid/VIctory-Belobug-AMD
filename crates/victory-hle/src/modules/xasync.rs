@@ -466,6 +466,37 @@ struct Call {
     identity: usize,
     done: Mutex<bool>,
     finished: Condvar,
+    /// Diagnostics: the API's name as the runtime passes it, when it
+    /// began, and who began it, for `stalled`.
+    #[cfg(feature = "diagnostics")]
+    began: (String, std::time::Instant, String),
+}
+
+/// Diagnostics: every 5 s, calls not finished after 5 s, each once, with
+/// the API's name and who began it. A title waiting on a call no provider
+/// ever completes waits here.
+#[cfg(feature = "diagnostics")]
+fn stalled() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::spawn(|| {
+            let mut told = std::collections::HashSet::new();
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                let calls: Vec<_> = lock(&CALLS).iter().map(|(b, c)| (*b, c.clone())).collect();
+                for (block, call) in calls {
+                    let (name, began, from) = &call.began;
+                    let age = began.elapsed();
+                    if age < Duration::from_secs(5) || *lock(&call.done) {
+                        continue;
+                    }
+                    if told.insert((block, *began)) {
+                        tracing::warn!(api = name, block = format_args!("{block:#x}"), secs = age.as_secs(), from, "async call not finished");
+                    }
+                }
+            }
+        });
+    });
 }
 
 impl Call {
@@ -518,9 +549,11 @@ pub fn XAsyncBegin(
     block: *mut AsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
-    _identity_name: *const u8,
+    identity_name: *const u8,
     provider: Option<Provider>,
 ) -> HRESULT {
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = identity_name;
     let Some(provider) = provider else {
         return E_INVALIDARG;
     };
@@ -536,6 +569,21 @@ pub fn XAsyncBegin(
         identity: identity as usize,
         done: Mutex::new(false),
         finished: Condvar::new(),
+        #[cfg(feature = "diagnostics")]
+        began: {
+            stalled();
+            let name = if identity_name.is_null() {
+                String::new()
+            } else {
+                // SAFETY: the runtime passes a NUL-terminated name.
+                unsafe { std::ffi::CStr::from_ptr(identity_name.cast()) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let from = super::kernel::callers();
+            tracing::debug!(api = name, from, "async call begun");
+            (name, std::time::Instant::now(), from)
+        },
     });
     lock(&CALLS).insert(block as usize, call.clone());
     // A failed begin fails the call, so the completion routine still runs.
