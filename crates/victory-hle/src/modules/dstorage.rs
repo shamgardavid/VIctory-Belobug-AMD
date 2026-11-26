@@ -954,6 +954,11 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
                 if fill == 0 {
                     break Err(END_OF_FILE);
                 }
+                tracing::warn!(
+                    at,
+                    bytes = fill,
+                    "dstorage: a read reached the lost end of a wrapped archive: zeros"
+                );
                 out[done..done + fill].fill(0);
                 done += fill;
             }

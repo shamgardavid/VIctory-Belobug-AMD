@@ -660,6 +660,7 @@ pub extern "system" fn ReadFile(
     if header == 0 {
         return read_file(file, buffer, len, read, overlapped);
     }
+    tracing::debug!(len, overlapped = !overlapped.is_null(), "read of a wrapped archive");
     let mut got = 0;
     let ok = if overlapped.is_null() {
         read_file(file, buffer, len, &mut got, overlapped)
@@ -729,6 +730,9 @@ fn zeros_past_the_copy(
         return 0;
     }
     let fill = (len - got).min((size as u64).saturating_sub(end) as u32);
+    if fill > 0 {
+        tracing::warn!(at = end, bytes = fill, "a read reached the lost end of a wrapped archive: zeros");
+    }
     // SAFETY: the title's buffer holds `len` bytes.
     unsafe { buffer.add(got as usize).write_bytes(0, fill as usize) };
     if overlapped.is_null() {
