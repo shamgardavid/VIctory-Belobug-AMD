@@ -36,7 +36,9 @@ running notes of how it got here are in
 
 **Game files must be complete.** A copy over a bad USB stick cut files short at
 64 KiB boundaries and the title hung or stopped with nothing on screen to say
-why; see the notes. Copy the whole folder in one go from the console.
+why; see the notes. Copy the whole folder in one go from the console. Here it is played from
+`C:\Coding\GTA6 Game files\Grand Theft Auto VI (fixed)`; `D:\GTA 6 game files\GTA 6\GTA6`
+is an untouched backup.
 
 ### First time (once per build or driver update)
 
@@ -48,7 +50,7 @@ Translate every shader into the cache (about 4 minutes; `VICTORY_PORT_CBV=1`
 must match how you play, it is part of the cache key):
 
 ```powershell
-$env:VICTORY_PORT_CBV='1'; target\diag\victory.exe shaders 'D:\GTA 6 game files\GTA 6\GTA6'
+$env:VICTORY_PORT_CBV='1'; target\diag\victory.exe shaders 'C:\Coding\GTA6 Game files\Grand Theft Auto VI (fixed)'
 ```
 
 Play once with `-More @{VICTORY_PIPELINE_BOOK='1'}` added to the command below
@@ -62,7 +64,7 @@ $env:VICTORY_PORT_CBV='1'; target\diag\victory.exe warm
 ### Playing
 
 ```powershell
-scripts\play.ps1 -Exe 'D:\GTA 6 game files\GTA 6\GTA6\game_scarlett_master.exe' -Console series-s -More @{VICTORY_PORT_CONSTANTS='1'; VICTORY_PORT_DESCRIPTORS='1'; VICTORY_PORT_CBV='1'; VICTORY_PORT_GUARD='1'; VICTORY_PORT_JOURNAL='1'; VICTORY_RESIDENCY='1'; VICTORY_LEVELS_ON_DEMAND='1'; VICTORY_MONITOR='2'}
+scripts\play.ps1 -Exe 'C:\Coding\GTA6 Game files\Grand Theft Auto VI (fixed)\game_scarlett_master.exe' -Console series-s -More @{VICTORY_PORT_CONSTANTS='1'; VICTORY_PORT_DESCRIPTORS='1'; VICTORY_PORT_CBV='1'; VICTORY_PORT_GUARD='1'; VICTORY_PORT_JOURNAL='1'; VICTORY_RESIDENCY='1'; VICTORY_LEVELS_ON_DEMAND='1'; VICTORY_MONITOR='2'}
 ```
 
 - `VICTORY_MONITOR='2'` puts the window on the second display (`\\.\DISPLAY2`); leave it out for the main one.
