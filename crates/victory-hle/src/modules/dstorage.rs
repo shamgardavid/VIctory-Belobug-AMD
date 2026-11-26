@@ -142,9 +142,14 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
         return from_win32(&error);
     }
     tracing::info!(path = name, iid = iid_text(iid), "dstorage: file opened");
+    // Its closing goes to the host directly, so it is not left registered.
+    let header = super::files::take_header(handle);
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { file });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File { file, header },
+    );
     put(out, file)
 }
 
@@ -258,6 +263,8 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 
 struct File {
     file: std::fs::File,
+    /// Bytes before the archive in a wrapped one (`files`), 0 otherwise.
+    header: u64,
 }
 
 static FILE_VTABLE: Methods<8> = Methods([
@@ -929,16 +936,27 @@ fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
         return Ok(());
     }
     // SAFETY: a file object we created; the title keeps it open.
-    let file = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .file;
+    let state = &unsafe { &*request.source.cast::<Instance<File>>() }.state;
+    let (file, header) = (&state.file, state.header);
     let started = std::time::Instant::now();
     let mut done = 0;
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        match file.seek_read(&mut out[done..], request.offset + done as u64) {
+        match file.seek_read(&mut out[done..], header + request.offset + done as u64) {
+            Ok(0) if header != 0 => {
+                // A wrapped archive lost its last `header` bytes (`files`):
+                // zeros, up to the file's size.
+                let size = file.metadata().map_or(0, |m| m.len());
+                let at = request.offset + done as u64;
+                let fill = (out.len() - done).min(size.saturating_sub(at) as usize);
+                if fill == 0 {
+                    break Err(END_OF_FILE);
+                }
+                out[done..done + fill].fill(0);
+                done += fill;
+            }
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => done += n,
             Err(error) => break Err(from_win32(&error)),

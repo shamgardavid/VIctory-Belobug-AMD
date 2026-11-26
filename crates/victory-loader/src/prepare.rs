@@ -42,6 +42,8 @@ impl PreparedImage {
 ///   its base relocation is made a no-op so the 0 survives a rebase;
 /// * `FORCE_INTEGRITY` cleared, checksum zeroed: the copy is unsigned.
 pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
+    let unwrapped = unwrap_xbe1(original);
+    let original = &*unwrapped;
     let info = ImageInfo::parse(original)?;
     let mut bytes = original.to_vec();
 
@@ -113,6 +115,29 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     })
 }
 
+/// Some copies of a package carry each DLL behind an `XBE1` header: 28
+/// bytes, the last four an entry count, then 8 bytes per entry. The image
+/// follows, but the file kept the image's length, so as many bytes of its
+/// end are gone; they come back as zeros (padding or the signature, in the
+/// DLLs seen). Anything else is returned as it is.
+pub fn unwrap_xbe1(bytes: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    let Some(count) = bytes
+        .strip_prefix(b"XBE1")
+        .and_then(|_| layout::read_u32(bytes, 24))
+    else {
+        return bytes.into();
+    };
+    let skip = 28 + 8 * count as usize;
+    match bytes.get(skip..) {
+        Some(inner) if inner.starts_with(b"MZ") => {
+            let mut image = inner.to_vec();
+            image.resize(bytes.len(), 0);
+            image.into()
+        }
+        _ => bytes.into(),
+    }
+}
+
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
 
@@ -176,6 +201,23 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xbe1_header_is_skipped() {
+        let original = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        let mut wrapped = b"XBE1".to_vec();
+        wrapped.extend([0; 20]);
+        wrapped.extend(2u32.to_le_bytes());
+        wrapped.extend([7; 16]);
+        // The copy keeps the image's length: its last 44 bytes are gone.
+        wrapped.extend(&original[..original.len() - 44]);
+        let unwrapped = unwrap_xbe1(&wrapped);
+        assert_eq!(unwrapped.len(), original.len());
+        assert_eq!(unwrapped[..original.len() - 44], original[..original.len() - 44]);
+        assert!(unwrapped[original.len() - 44..].iter().all(|&b| b == 0));
+        assert_eq!(&*unwrap_xbe1(&original), &original[..]);
+        assert!(prepare(&wrapped).is_ok());
+    }
 
     #[test]
     fn patches_own_test_binary() {

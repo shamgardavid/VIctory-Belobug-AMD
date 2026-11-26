@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
-use windows_sys::Win32::Storage::FileSystem::GetLogicalDrives;
+use windows_sys::Win32::Storage::FileSystem::{CREATEFILE2_EXTENDED_PARAMETERS, GetLogicalDrives};
 
 use crate::{HleExport, HleModule, hle_export};
 
@@ -268,7 +268,9 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+    let wrapped = disposition == OPEN_EXISTING && is_wrapped_archive(p.ptr());
+    let flags = if wrapped { flags & !FILE_FLAG_NO_BUFFERING } else { flags };
+    let handle = host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
         share,
@@ -276,7 +278,11 @@ pub extern "system" fn CreateFileW(
         disposition,
         flags,
         template,
-    )
+    );
+    if wrapped {
+        opened_wrapped(handle);
+    }
+    handle
 }
 
 pub extern "system" fn CreateFileA(
@@ -321,13 +327,134 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
-    host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
+    let wrapped = disposition == OPEN_EXISTING && is_wrapped_archive(p.ptr());
+    let mut own = None;
+    if wrapped && !params.is_null() {
+        // SAFETY: the title passes a CREATEFILE2_EXTENDED_PARAMETERS.
+        let mut copy =
+            unsafe { params.cast::<CREATEFILE2_EXTENDED_PARAMETERS>().read_unaligned() };
+        copy.dwFileFlags &= !FILE_FLAG_NO_BUFFERING;
+        own = Some(copy);
+    }
+    let params = own.as_ref().map_or(params, |c| {
+        (c as *const CREATEFILE2_EXTENDED_PARAMETERS).cast()
+    });
+    let handle = host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,
         share,
         disposition,
         params,
-    )
+    );
+    if wrapped {
+        opened_wrapped(handle);
+    }
+    handle
+}
+
+// Archives behind an `XRP1` header. Some copies of a package carry each
+// archive behind 89 bytes of header, the RPF9 archive following. The file
+// kept the archive's length, so its last 89 bytes are gone. A handle opened
+// on one sees the archive: read offsets and the file pointer are shifted
+// past the header, the size is the file's, and reads of the lost end get
+// zeros. Unbuffered reads would need aligned offsets, so such a handle is
+// opened buffered. DirectStorage files carry the shift themselves
+// (`take_header`).
+// ponytail: a read the host leaves pending (overlapped handle) that reaches
+// the lost end comes back short; zero-fill at completion if titles need it.
+
+const XRP1_HEADER: u64 = 89;
+const OPEN_EXISTING: u32 = 3;
+const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+const FILE_BEGIN: u32 = 0;
+const FILE_CURRENT: u32 = 1;
+
+/// Handles open on wrapped archives.
+static WRAPPED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// Whether the host file at `path` (NUL-terminated) is a wrapped archive.
+/// Looked at before the title's own open, which may share nothing.
+fn is_wrapped_archive(path: *const u16) -> bool {
+    use std::io::Read;
+    use std::os::windows::ffi::OsStringExt;
+    if path.is_null() {
+        return false;
+    }
+    // SAFETY: a NUL-terminated path.
+    let path = unsafe {
+        let len = (0..).take_while(|&i| *path.add(i) != 0).count();
+        std::slice::from_raw_parts(path, len)
+    };
+    let tail = String::from_utf16_lossy(&path[path.len().saturating_sub(4)..]);
+    if !tail.eq_ignore_ascii_case(".rpf") {
+        return false;
+    }
+    let mut magic = [0; 4];
+    std::fs::File::open(std::ffi::OsString::from_wide(path))
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && magic == *b"XRP1"
+}
+
+fn opened_wrapped(handle: Handle) {
+    if handle as isize == -1 || handle.is_null() {
+        return;
+    }
+    WRAPPED.lock().unwrap().push(handle as usize);
+    // Reads without an offset start after the header.
+    host!("kernel32.dll", "SetFilePointerEx": extern "system" fn(Handle, i64, *mut i64, u32) -> i32)(
+        handle,
+        XRP1_HEADER as i64,
+        std::ptr::null_mut(),
+        FILE_BEGIN,
+    );
+}
+
+/// Bytes of header before the archive behind `handle`; 0 for other handles.
+fn header_of(handle: Handle) -> u64 {
+    if WRAPPED.lock().unwrap().contains(&(handle as usize)) {
+        XRP1_HEADER
+    } else {
+        0
+    }
+}
+
+/// For a handle whose closing we will not see: its header, and it is
+/// forgotten here, so a later handle of the same value is not shifted.
+pub(crate) fn take_header(handle: Handle) -> u64 {
+    let mut wrapped = WRAPPED.lock().unwrap();
+    match wrapped.iter().position(|&h| h == handle as usize) {
+        Some(i) => {
+            wrapped.swap_remove(i);
+            XRP1_HEADER
+        }
+        None => 0,
+    }
+}
+
+pub extern "system" fn SetFilePointerEx(
+    file: Handle,
+    distance: i64,
+    new: *mut i64,
+    method: u32,
+) -> i32 {
+    // From the start or the end (the same in both views), the host's
+    // position is the title's plus the header.
+    let header = header_of(file) as i64;
+    let distance = if method == FILE_CURRENT { distance } else { distance + header };
+    let ok = host!("kernel32.dll", "SetFilePointerEx": extern "system" fn(Handle, i64, *mut i64, u32) -> i32)(
+        file, distance, new, method,
+    );
+    if ok != 0 && header != 0 && !new.is_null() {
+        // SAFETY: the host just wrote it.
+        unsafe { *new -= header };
+    }
+    ok
+}
+
+pub extern "system" fn CloseHandle(handle: Handle) -> i32 {
+    take_header(handle);
+    host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32)(handle)
 }
 
 pub extern "system" fn DeleteFileA(path: *const c_char) -> i32 {
@@ -528,9 +655,86 @@ pub extern "system" fn ReadFile(
     overlapped: *mut c_void,
 ) -> i32 {
     victory_gpu::kernel_will_write(buffer as usize, len as usize);
-    host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
-        file, buffer, len, read, overlapped,
-    )
+    let read_file = host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32);
+    let header = header_of(file);
+    if header == 0 {
+        return read_file(file, buffer, len, read, overlapped);
+    }
+    let mut got = 0;
+    let ok = if overlapped.is_null() {
+        read_file(file, buffer, len, &mut got, overlapped)
+    } else {
+        // OVERLAPPED's Offset and OffsetHigh (bytes 16..24) are one u64.
+        // The kernel takes the offset when the read is issued, so it is
+        // put back right after, pending or not.
+        // ponytail: another title thread reading that OVERLAPPED during
+        // the call would see the shifted offset.
+        // SAFETY: the title passes an OVERLAPPED.
+        let offset = unsafe { overlapped.cast::<u8>().add(16).cast::<u64>() };
+        unsafe { offset.write_unaligned(offset.read_unaligned() + header) };
+        let ok = read_file(file, buffer, len, &mut got, overlapped);
+        unsafe { offset.write_unaligned(offset.read_unaligned() - header) };
+        ok
+    };
+    const ERROR_HANDLE_EOF: u32 = 38;
+    // SAFETY: plain host call.
+    let at_end = || unsafe { windows_sys::Win32::Foundation::GetLastError() } == ERROR_HANDLE_EOF;
+    let mut ok = ok;
+    if (ok != 0 || (!overlapped.is_null() && at_end())) && got < len {
+        let fill = zeros_past_the_copy(file, header, overlapped, buffer, got, len);
+        if fill > 0 && ok == 0 {
+            // What GetOverlappedResult reports: success, and the count.
+            // SAFETY: the title passes an OVERLAPPED.
+            unsafe {
+                let o = overlapped.cast::<usize>();
+                o.write_unaligned(0);
+                o.add(1).write_unaligned((got + fill) as usize);
+            }
+            ok = 1;
+        }
+        got += fill;
+    }
+    if !read.is_null() {
+        // SAFETY: the title's count.
+        unsafe { *read = got };
+    }
+    ok
+}
+
+/// After a read of a wrapped archive that came back short: zeros for what
+/// it asked of the archive's lost end, the file pointer moved past them.
+/// Returns how many.
+fn zeros_past_the_copy(
+    file: Handle,
+    header: u64,
+    overlapped: *mut c_void,
+    buffer: *mut u8,
+    got: u32,
+    len: u32,
+) -> u32 {
+    let set_pointer = host!("kernel32.dll", "SetFilePointerEx": extern "system" fn(Handle, i64, *mut i64, u32) -> i32);
+    let mut size = 0;
+    let size_known = host!("kernel32.dll", "GetFileSizeEx": extern "system" fn(Handle, *mut i64) -> i32)(file, &mut size);
+    // Where the read ended, in the title's view.
+    let end = if overlapped.is_null() {
+        let mut at = 0;
+        set_pointer(file, 0, &mut at, FILE_CURRENT);
+        at as u64 - header
+    } else {
+        // SAFETY: the title passes an OVERLAPPED; its offset is put back.
+        let offset = unsafe { overlapped.cast::<u8>().add(16).cast::<u64>().read_unaligned() };
+        offset + got as u64
+    };
+    if size_known == 0 {
+        return 0;
+    }
+    let fill = (len - got).min((size as u64).saturating_sub(end) as u32);
+    // SAFETY: the title's buffer holds `len` bytes.
+    unsafe { buffer.add(got as usize).write_bytes(0, fill as usize) };
+    if overlapped.is_null() {
+        set_pointer(file, fill as i64, std::ptr::null_mut(), FILE_CURRENT);
+    }
+    fill
 }
 
 /// The host CRT reads large requests straight into the caller's buffer.
@@ -663,6 +867,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-file-*",
+            "api-ms-win-core-handle-*",
             "api-ms-win-core-processenvironment-*",
             "ucrtbase.dll",
             "api-ms-win-crt-stdio-*",
@@ -672,6 +877,8 @@ pub(crate) fn module() -> HleModule {
         ],
         exports: vec![
             hle_export!(ReadFile),
+            hle_export!(SetFilePointerEx),
+            hle_export!(CloseHandle),
             hle_export!(fread),
             hle_export!(CreateFileW),
             hle_export!(CreateFileA),
@@ -733,6 +940,55 @@ mod tests {
         let handle = file.as_raw_handle().cast();
         assert_ne!(ReadFile(handle, out.as_mut_ptr(), 10, &mut n, std::ptr::null_mut()), 0);
         assert_eq!((&out, n), (b"0123456789", 10));
+    }
+
+    #[test]
+    fn wrapped_archives_are_seen_without_their_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rpf");
+        let mut bytes = b"XRP1".to_vec();
+        bytes.resize(XRP1_HEADER as usize, 0);
+        bytes.extend(b"9FPRabcdef");
+        std::fs::write(&path, &bytes).unwrap();
+        const GENERIC_READ: u32 = 0x8000_0000;
+        let h = CreateFileW(
+            w(&path.display().to_string()).as_ptr(),
+            GENERIC_READ,
+            1,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_NO_BUFFERING,
+            std::ptr::null_mut(),
+        );
+        assert_ne!(h as isize, -1);
+        // The archive is 99 bytes, as the file; 89 of its end were lost.
+        let (mut out, mut n) = ([0u8; 4], 0);
+        assert_ne!(ReadFile(h, out.as_mut_ptr(), 4, &mut n, std::ptr::null_mut()), 0);
+        assert_eq!(&out, b"9FPR", "reads start after the header");
+        let mut at = -1;
+        assert_ne!(SetFilePointerEx(h, 2, &mut at, FILE_BEGIN), 0);
+        assert_eq!(at, 2);
+        // An explicit offset: OVERLAPPED's Offset at byte 16.
+        let mut overlapped = [0u64; 4];
+        overlapped[2] = 6;
+        assert_ne!(ReadFile(h, out.as_mut_ptr(), 4, &mut n, overlapped.as_mut_ptr().cast()), 0);
+        assert_eq!(&out, b"cdef");
+        assert_eq!(overlapped[2], 6, "the title's offset is put back");
+        // Across the lost end: what is there, then zeros up to 99.
+        let mut big = [7u8; 120];
+        assert_ne!(SetFilePointerEx(h, 8, &mut at, FILE_BEGIN), 0);
+        assert_ne!(ReadFile(h, big.as_mut_ptr(), 120, &mut n, std::ptr::null_mut()), 0);
+        assert_eq!((n, &big[..2]), (91, &b"ef"[..]));
+        assert!(big[2..91].iter().all(|&b| b == 0));
+        assert_ne!(SetFilePointerEx(h, 0, &mut at, FILE_CURRENT), 0);
+        assert_eq!(at, 99);
+        assert_ne!(SetFilePointerEx(h, -1, &mut at, 2), 0, "from the end");
+        assert_eq!(at, 98);
+        overlapped[2] = 50;
+        assert_ne!(ReadFile(h, big.as_mut_ptr(), 4, &mut n, overlapped.as_mut_ptr().cast()), 0);
+        assert_eq!((n, &big[..4]), (4, &[0u8; 4][..]), "wholly in the lost end");
+        assert_ne!(CloseHandle(h), 0);
+        assert_eq!(header_of(h), 0, "a closed handle is forgotten");
     }
 
     fn text(v: &[u16]) -> String {
