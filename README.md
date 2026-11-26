@@ -71,7 +71,7 @@ $env:VICTORY_PORT_CBV='1'; target\diag\victory.exe warm
 ### Playing
 
 ```powershell
-scripts\play.ps1 -Exe 'C:\Coding\GTA6 Game files\Grand Theft Auto VI (fixed)\game_scarlett_master.exe' -Console series-s -More @{VICTORY_PORT_CONSTANTS='1'; VICTORY_PORT_DESCRIPTORS='1'; VICTORY_PORT_CBV='1'; VICTORY_PORT_GUARD='1'; VICTORY_PORT_JOURNAL='1'; VICTORY_RESIDENCY='1'; VICTORY_LEVELS_ON_DEMAND='1'}
+scripts\play.ps1 -Exe 'C:\Coding\GTA6 Game files\Grand Theft Auto VI (fixed)\game_scarlett_master.exe' -Console series-s -More @{VICTORY_PORT_CONSTANTS='1'; VICTORY_PORT_DESCRIPTORS='1'; VICTORY_PORT_CBV='1'; VICTORY_PORT_GUARD='1'; VICTORY_PORT_JOURNAL='1'; VICTORY_RESIDENCY='1'; VICTORY_LEVELS_ON_DEMAND='1'; VICTORY_AMBIENT_AIR='1'}
 ```
 
 - `VICTORY_MONITOR='2'` puts the window on the second display (`\\.\DISPLAY2`); leave it out for the main one.
