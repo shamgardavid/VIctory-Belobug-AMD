@@ -151,16 +151,22 @@ pub extern "system" fn CreateWindowExA(
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
+/// chain stretches). `VICTORY_MONITOR=<n>` puts it on `\.DISPLAY<n>`.
+/// `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let chosen = chosen_monitor();
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
-    let known =
-        unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) };
+    let known = chosen.is_some()
+        || unsafe { wm::SystemParametersInfoW(wm::SPI_GETWORKAREA, 0, (&raw mut area).cast(), 0) }
+            != 0;
+    if let Some(chosen) = chosen {
+        area = chosen;
+    }
     let limit = window_limit();
     let fitted = fit_with_limit(&area, width, height, limit);
-    if !parent.is_null() || known == 0 || fitted == (width, height) {
+    if !parent.is_null() || !known || (fitted == (width, height) && chosen.is_none()) {
         return (x, y, width, height);
     }
     tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
@@ -168,6 +174,44 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The work area of the display `VICTORY_MONITOR` names, if it is there.
+fn chosen_monitor() -> Option<RECT> {
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    };
+    extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> i32 {
+        // SAFETY: `data` is the search below, alive for the enumeration.
+        let (wanted, found) = unsafe { &mut *(data as *mut (String, Option<RECT>)) };
+        let mut info: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: `info` is sized for the extended form.
+        if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast()) } == 0 {
+            return 1;
+        }
+        let len = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+        if String::from_utf16_lossy(&info.szDevice[..len]).eq_ignore_ascii_case(wanted) {
+            *found = Some(info.monitorInfo.rcWork);
+            return 0;
+        }
+        1
+    }
+    let n = std::env::var("VICTORY_MONITOR").ok()?;
+    let mut search = (format!(r"\\.\DISPLAY{}", n.trim()), None);
+    // SAFETY: `each` reads the search through the pointer while it runs.
+    unsafe {
+        EnumDisplayMonitors(
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            Some(each),
+            (&raw mut search) as LPARAM,
+        )
+    };
+    if search.1.is_none() {
+        tracing::warn!(monitor = search.0, "VICTORY_MONITOR: no such display; the primary is used");
+    }
+    search.1
 }
 
 fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
