@@ -4037,6 +4037,12 @@ impl<'a> Lower<'a> {
         Some(r)
     }
 
+    /// Both dwords `(lo, hi)` of a lane mask's ballot, as [`Self::mask_dword`]
+    /// takes it; `None` where it is no ballot (a number, say) or cannot be read.
+    fn mask_ballot(&mut self, lo: Value) -> Option<(V, V)> {
+        self.mask_dword(lo).ok()?;
+        self.ballots.get(&lo).copied()
+    }
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -4108,6 +4114,84 @@ impl<'a> Lower<'a> {
             }
         };
         Ok(if high { y } else { x })
+    }
+
+    /// For a wave32 program under [`MaskData::Host`], a 32-bit scalar operand
+    /// holding a tracked mask still represents a host-wave ballot, so its
+    /// `(lo, hi)` pair must be read to preserve lanes 32-63 on wave64 hosts.
+    fn host_mask_pair(&mut self, inst: &Inst, op: &Operand) -> Result<Option<(V, V)>, Why> {
+        if self.mask_data != MaskData::Host || self.x.native.wave64 {
+            return Ok(None);
+        }
+        let Operand::Scalar { code, .. } = *op else {
+            return Ok(None);
+        };
+        if code == NULL {
+            return Ok(None);
+        }
+        let Some(v) = inst.read(Reg::S(code)) else {
+            return Ok(None);
+        };
+        if matches!(self.vals.get(&v), Some(Val::I32(_) | Val::Bit(_)))
+            || !self.x.st.masks.contains_key(&v)
+        {
+            return Ok(None);
+        }
+        Ok(self.mask_ballot(v))
+    }
+
+    fn is_zero_operand(op: &Operand) -> bool {
+        matches!(op, Operand::Scalar { code: NULL, .. } | Operand::Literal(0))
+            || matches!(op, Operand::Const(c) if crate::resource::inline(*c) == Some(0))
+    }
+
+    fn bcnt1_64(&mut self, c: usize, a: V, b: V) -> V {
+        let i32t = self.s.t.i32;
+        let na = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
+        let nb = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
+        self.s.m.bin(c, Bin::Add, na, nb)
+    }
+
+    fn ff1_64(&mut self, c: usize, a: V, b: V) -> V {
+        // The lowest set bit; -1 for none (as DXIL's first bit low).
+        let i32t = self.s.t.i32;
+        let fa = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
+        let fb = self
+            .s
+            .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
+        let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
+        let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
+        let none = self.s.m.cmp(c, pred::EQ, b, z);
+        let fb = self.s.m.select(c, none, fb, fb32);
+        let low = self.s.m.cmp(c, pred::NE, a, z);
+        self.s.m.select(c, low, fa, fb)
+    }
+
+    fn eq_64(&mut self, c: usize, (a0, a1): (V, V), (b0, b1): (V, V)) -> V {
+        let e0 = self.s.m.cmp(c, pred::EQ, a0, b0);
+        let e1 = self.s.m.cmp(c, pred::EQ, a1, b1);
+        self.s.m.bin(c, Bin::And, e0, e1)
+    }
+
+    /// `(1 << below) - 1`, all ones from 32 on.
+    fn below_mask(&mut self, c: usize, below: V) -> V {
+        let (one, k31, k32, ones) = (
+            self.s.m.i32(1),
+            self.s.m.i32(31),
+            self.s.m.i32(32),
+            self.s.m.i32(u32::MAX),
+        );
+        let sh = self.s.m.bin(c, Bin::And, below, k31);
+        let m = self.s.m.bin(c, Bin::Shl, one, sh);
+        let m = self.s.m.bin(c, Bin::Sub, m, one);
+        let full = self.s.m.cmp(c, pred::IUGE, below, k32);
+        self.s.m.select(c, full, ones, m)
     }
 
     // ---- operands ----
@@ -5295,6 +5379,52 @@ impl<'a> Lower<'a> {
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
+    /// Whether lane `src` is in EXEC here (`guard` for straight-line
+    /// narrowing, and the host wave's live lanes for structured control
+    /// flow), for DPP sources (upstream b51011a). `None` for unguarded pixel
+    /// code: whole-quad mode keeps helper lanes on, which ballots leave out.
+    fn src_lane_active(&mut self, src: V, guard: Option<V>, mesh_quad: bool, quad: bool) -> Option<V> {
+        let c = self.cur;
+        if self.s.pixel {
+            // (other lanes than the quad's: as before, read as the host has them)
+            if !quad {
+                return None;
+            }
+            let g = guard?;
+            let (one, zero) = (self.s.m.i32(1), self.s.m.i32(0));
+            let active = self.s.m.select(c, g, one, zero);
+            let picked = self.quad_pick(active, src);
+            return Some(self.s.m.cmp(c, pred::NE, picked, zero));
+        }
+        let bit = guard.unwrap_or_else(|| self.s.m.bool(true));
+        let i32t = self.s.t.i32;
+        let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+        let ballot = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+        self.s.flags |= flags::WAVE_OPS;
+        let (lo, hi) = (self.s.m.extract(c, ballot, 0), self.s.m.extract(c, ballot, 1));
+        let lane = if mesh_quad {
+            let host = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+            let (not3, three) = (self.s.m.i32(!3), self.s.m.i32(3));
+            let base = self.s.m.bin(c, Bin::And, host, not3);
+            let q = self.s.m.bin(c, Bin::And, src, three);
+            self.s.m.bin(c, Bin::Or, base, q)
+        } else if self.exchange.is_some() {
+            // a console wave of 64 run as two host waves of 32: the source
+            // (in the lane's own row) is in this host wave, at its low bits
+            let k31 = self.s.m.i32(31);
+            self.s.m.bin(c, Bin::And, src, k31)
+        } else {
+            src
+        };
+        let (k31, k32, one, z) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(1), self.s.m.i32(0));
+        let low = self.s.m.cmp(c, pred::IULT, lane, k32);
+        let word = self.s.m.select(c, low, lo, hi);
+        let sh = self.s.m.bin(c, Bin::And, lane, k31);
+        let t = self.s.m.bin(c, Bin::LShr, word, sh);
+        let t = self.s.m.bin(c, Bin::And, t, one);
+        Some(self.s.m.cmp(c, pred::NE, t, z))
+    }
+
     fn quad_pick(&mut self, x: V, src: V) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
@@ -5568,8 +5698,18 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            // Within the lane's own 32-lane half (RDNA 2 ISA, section
+            // 10.4.4: wave64 permutes lanes 0..31 and 32..63 independently).
+            let mask31 = self.s.m.i32(31);
+            let src = self.s.m.bin(c, Bin::And, src, mask31);
+            let src = if self.x.native.wave64 {
+                let me = self.lane_index();
+                let not31 = self.s.m.i32(!31);
+                let base = self.s.m.bin(c, Bin::And, me, not31);
+                self.s.m.bin(c, Bin::Or, base, src)
+            } else {
+                src
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
@@ -6205,6 +6345,32 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         if let Some(op) = name.strip_prefix("s_cmp_").or(name.strip_prefix("s_cmpk_")) {
+            if matches!(name, "s_cmp_eq_u32" | "s_cmp_lg_u32") {
+                let s0 = src.first().ok_or("a missing operand")?;
+                let s1 = src.get(1).ok_or("a missing operand")?;
+                let p0 = self.host_mask_pair(inst, s0)?;
+                let p1 = self.host_mask_pair(inst, s1)?;
+                let eq = match (p0, p1) {
+                    (Some(a), Some(b)) => Some(self.eq_64(c, a, b)),
+                    (Some(a), None) if Self::is_zero_operand(s1) => {
+                        let z = self.s.m.i32(0);
+                        Some(self.eq_64(c, a, (z, z)))
+                    }
+                    (None, Some(b)) if Self::is_zero_operand(s0) => {
+                        let z = self.s.m.i32(0);
+                        Some(self.eq_64(c, (z, z), b))
+                    }
+                    _ => None,
+                };
+                if let Some(mut r) = eq {
+                    if op.starts_with("lg") {
+                        let t = self.s.m.bool(true);
+                        r = self.s.m.bin(c, Bin::Xor, r, t);
+                    }
+                    self.set(scc, Val::Bit(r));
+                    return Ok(());
+                }
+            }
             let (a, b) = if name.starts_with("s_cmpk_") {
                 let b = if op.ends_with("_i32") {
                     sext16(self)
@@ -6261,14 +6427,7 @@ impl<'a> Lower<'a> {
                 }
                 "s_bcnt1_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let i32t = self.s.t.i32;
-                    let na = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[a]);
-                    let nb = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 31, &[b]);
-                    let r = self.s.m.bin(c, Bin::Add, na, nb);
+                    let r = self.bcnt1_64(c, a, b);
                     self.set(lo, Val::I32(r));
                     let z = self.s.m.i32(0);
                     let s = self.s.m.cmp(c, pred::NE, r, z);
@@ -6276,21 +6435,8 @@ impl<'a> Lower<'a> {
                     Ok(())
                 }
                 "s_ff1_i32_b64" => {
-                    // The lowest set bit; -1 for none (as DXIL's first bit low).
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
-                    let i32t = self.s.t.i32;
-                    let fa = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[a]);
-                    let fb = self
-                        .s
-                        .op(c, "unaryBits.i32", Attr::ReadNone, i32t, 32, &[b]);
-                    let (z, k32) = (self.s.m.i32(0), self.s.m.i32(32));
-                    let fb32 = self.s.m.bin(c, Bin::Add, fb, k32);
-                    let none = self.s.m.cmp(c, pred::EQ, b, z);
-                    let fb = self.s.m.select(c, none, fb, fb32);
-                    let low = self.s.m.cmp(c, pred::NE, a, z);
-                    let r = self.s.m.select(c, low, fa, fb);
+                    let r = self.ff1_64(c, a, b);
                     self.set(lo, Val::I32(r));
                     Ok(())
                 }
@@ -6457,11 +6603,19 @@ impl<'a> Lower<'a> {
             }
             "s_ff1_i32_b32" | "s_bcnt1_i32_b32" => {
                 // First set bit (-1 for zero, as DXIL's), or the bit count.
-                let a = src32(self, 0)?;
-                let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
-                let r = self
-                    .s
-                    .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a]);
+                let op0 = src.first().ok_or("a missing operand")?;
+                let r = if let Some((a, b)) = self.host_mask_pair(inst, op0)? {
+                    if name == "s_ff1_i32_b32" {
+                        self.ff1_64(c, a, b)
+                    } else {
+                        self.bcnt1_64(c, a, b)
+                    }
+                } else {
+                    let a = src32(self, 0)?;
+                    let op = if name == "s_ff1_i32_b32" { 32 } else { 31 };
+                    self.s
+                        .op(c, "unaryBits.i32", Attr::ReadNone, self.s.t.i32, op, &[a])
+                };
                 (r, None)
             }
             "s_bfe_u32" | "s_bfe_i32" => {
@@ -6502,12 +6656,21 @@ impl<'a> Lower<'a> {
                 (self.s.m.bin(c, op, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                // SCC: the sum overflows 32 bits, through bits shifted out
+                // of src0 or the add's carry.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                let (rest, z) = (self.s.m.i32(32 - n), self.s.m.i32(0));
+                let out = self.s.m.bin(c, Bin::LShr, a, rest);
+                let shifted_out = self.s.m.cmp(c, pred::NE, out, z);
+                let carry = self.s.m.cmp(c, pred::IULT, r, t);
+                (r, Some(self.s.m.bin(c, Bin::Or, shifted_out, carry)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
+                // SCC: src0 is the one chosen.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let p = match name {
                     "s_min_u32" => pred::IULT,
@@ -6516,7 +6679,7 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -8428,7 +8591,7 @@ impl<'a> Lower<'a> {
         }
         let mut guard = self.guard(b, i)?;
         if let Some(d) = v.dpp {
-            let (x, enable) = self.dpp(inst, d)?;
+            let (x, enable) = self.dpp(inst, d, guard)?;
             guard = match (guard, enable) {
                 (Some(g), Some(e)) => Some(self.s.m.bin(self.cur, Bin::And, g, e)),
                 (g, e) => g.or(e),
@@ -8442,7 +8605,7 @@ impl<'a> Lower<'a> {
 
     /// DPP: src0 as read from another lane, and which lanes write their
     /// result (none: all).
-    fn dpp(&mut self, inst: &Inst, dpp: Dpp) -> Result<(V, Option<V>), Why> {
+    fn dpp(&mut self, inst: &Inst, dpp: Dpp, guard: Option<V>) -> Result<(V, Option<V>), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
@@ -8462,9 +8625,10 @@ impl<'a> Lower<'a> {
         let (sixteen_mask, low) = (k(self, !15), k(self, 15));
         let row = self.s.m.bin(c, Bin::And, lane, sixteen_mask);
         let pos = self.s.m.bin(c, Bin::And, lane, low);
-        // Source lane, and whether it lies in the row.
-        let (src, inside, masks, zero) = match dpp {
-            Dpp::Lanes { sel, .. } => {
+        // Source lane, whether it lies in the row, the write masks, whether an
+        // invalid source gives 0 (else the write is off), and fetch-inactive.
+        let (src, inside, masks, zero, fi) = match dpp {
+            Dpp::Lanes { sel, fi } => {
                 let (seven, not7, three) = (k(self, 7), k(self, !7), k(self, 3));
                 let p = self.s.m.bin(c, Bin::And, lane, seven);
                 let sh = self.s.m.bin(c, Bin::Mul, p, three);
@@ -8472,14 +8636,14 @@ impl<'a> Lower<'a> {
                 let pick = self.s.m.bin(c, Bin::LShr, sel, sh);
                 let pick = self.s.m.bin(c, Bin::And, pick, seven);
                 let base = self.s.m.bin(c, Bin::And, lane, not7);
-                (self.s.m.bin(c, Bin::Or, base, pick), None, None, false)
+                (self.s.m.bin(c, Bin::Or, base, pick), None, None, true, fi)
             }
             Dpp::Row {
                 ctrl,
                 row_mask,
                 bank_mask,
                 bound_ctrl,
-                ..
+                fi,
             } => {
                 let n = u32::from(ctrl & 15);
                 let (src, inside) = match ctrl {
@@ -8528,8 +8692,15 @@ impl<'a> Lower<'a> {
                     _ => return Err("a DPP lane pattern"),
                 };
                 let masks = (row_mask != 0xF || bank_mask != 0xF).then_some((row_mask, bank_mask));
-                (src, inside, masks, bound_ctrl)
+                (src, inside, masks, bound_ctrl, fi)
             }
+        };
+        // A source lane EXEC leaves out is invalid, as one outside the row
+        // (unless fetch-inactive): the host reads no defined value there.
+        let src_active = if fi { None } else { self.src_lane_active(src, guard, mesh_quad, quad) };
+        let valid = match (inside, src_active) {
+            (Some(i), Some(a)) => Some(self.s.m.bin(c, Bin::And, i, a)),
+            (i, a) => i.or(a),
         };
         let mut r = if mesh_quad {
             self.quad_pick(x, src)
@@ -8538,15 +8709,19 @@ impl<'a> Lower<'a> {
         {
             self.quad_read(x, [0, 1, 2, 3].map(|i| (ctrl >> (2 * i) & 3) as u8))
         } else {
-            self.read_lane(x, src)
+            let safe = match valid {
+                Some(ok) => self.s.m.select(c, ok, src, lane),
+                None => src,
+            };
+            self.read_lane(x, safe)
         };
         let mut enable = None;
-        if let Some(inside) = inside {
+        if let Some(ok) = valid {
             if zero {
                 let z = k(self, 0);
-                r = self.s.m.select(c, inside, r, z);
+                r = self.s.m.select(c, ok, r, z);
             } else {
-                enable = Some(inside);
+                enable = Some(ok);
             }
         }
         if let Some((rows, banks)) = masks {
@@ -9577,6 +9752,44 @@ impl<'a> Lower<'a> {
                 // register: zero-extended.
                 let x = self.operand(inst, &op)?;
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
+            }
+        }
+    }
+
+    /// Operand `k` of a 64-bit instruction as its low and high dwords (i32),
+    /// as [`Self::src64`] reads it: register pairs, inline constants and a
+    /// signed instruction's literal sign-extended, other literals and the
+    /// null register zero-extended.
+    fn src64_dwords(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0 || v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))
+            }
+            Operand::Const(k @ 128..=208) => {
+                let x = crate::resource::inline(k).ok_or("a special operand")?;
+                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            Operand::Literal(x) if inst.name().ends_with("_i64") => {
+                let hi = if (x as i32) < 0 { u32::MAX } else { 0 };
+                Ok((self.s.m.i32(x), self.s.m.i32(hi)))
+            }
+            _ => {
+                let x = self.operand(inst, &op)?;
+                Ok((x, self.s.m.i32(0)))
             }
         }
     }
@@ -10810,7 +11023,7 @@ impl<'a> Lower<'a> {
             "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32" => {
                 // Bits of the mask's low (high) half below this lane, plus src1:
                 // with an all-ones mask, the lane index.
-                let (a, b) = (s(self, 0)?, s(self, 1)?);
+                let b = s(self, 1)?;
                 // Mesh lanes are the console's by construction; pixel and
                 // vertex lanes are the host's, as their masks are.
                 if self.mask_data == MaskData::Host {
@@ -10818,6 +11031,33 @@ impl<'a> Lower<'a> {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
+                    if name == "v_mbcnt_lo_u32_b32" && !self.x.native.wave64 {
+                        if matches!(v.src.first(), Some(&Operand::Const(193))) {
+                            self.s.flags |= flags::WAVE_OPS;
+                            let lane = self.lane_index();
+                            return Ok(self.s.m.bin(c, Bin::Add, lane, b));
+                        }
+                        if let Some((lo, hi)) = v
+                            .src
+                            .first()
+                            .map(|op| self.host_mask_pair(inst, op))
+                            .transpose()?
+                            .flatten()
+                        {
+                            self.s.flags |= flags::WAVE_OPS;
+                            let lane = self.lane_index();
+                            let m_lo = self.below_mask(c, lane);
+                            let (k32, z) = (k(self, 32), k(self, 0));
+                            let t = self.s.m.bin(c, Bin::Sub, lane, k32);
+                            let low = self.s.m.cmp(c, pred::IULT, lane, k32);
+                            let below_hi = self.s.m.select(c, low, z, t);
+                            let m_hi = self.below_mask(c, below_hi);
+                            let x_lo = self.s.m.bin(c, Bin::And, lo, m_lo);
+                            let x_hi = self.s.m.bin(c, Bin::And, hi, m_hi);
+                            let n = self.bcnt1_64(c, x_lo, x_hi);
+                            return Ok(self.s.m.bin(c, Bin::Add, n, b));
+                        }
+                    }
                     let host = match v.src.first() {
                         Some(&Operand::Const(193)) => true,
                         Some(&Operand::Scalar { code, .. }) => {
@@ -10834,6 +11074,7 @@ impl<'a> Lower<'a> {
                 } else if self.s.mesh.is_none() {
                     self.cross_lane(false)?;
                 }
+                let a = s(self, 0)?;
                 let lane = self.console_lane();
                 let below = if name == "v_mbcnt_lo_u32_b32" {
                     lane
@@ -10843,13 +11084,7 @@ impl<'a> Lower<'a> {
                     let low = self.s.m.cmp(c, pred::IULT, lane, k32);
                     self.s.m.select(c, low, z, t)
                 };
-                // (1 << below) - 1, all ones from 32 on.
-                let (one, k32, ones) = (k(self, 1), k(self, 32), k(self, u32::MAX));
-                let sh = m31(self, below);
-                let m = self.s.m.bin(c, Bin::Shl, one, sh);
-                let m = self.s.m.bin(c, Bin::Sub, m, one);
-                let full = self.s.m.cmp(c, pred::IUGE, below, k32);
-                let m = self.s.m.select(c, full, ones, m);
+                let m = self.below_mask(c, below);
                 let x = self.s.m.bin(c, Bin::And, a, m);
                 let n = self
                     .s
@@ -10946,6 +11181,45 @@ impl<'a> Lower<'a> {
                     let lt = self.s.m.cmp(c, pred::OLT, a, b);
                     let gt = self.s.m.cmp(c, pred::OGT, a, b);
                     self.s.m.bin(c, Bin::Or, lt, gt)
+                } else if let Some(r) = {
+                    // Ordered/unordered tests, and self compares that only a NaN
+                    // decides, through `is_nan_f32` (integer arithmetic): drivers
+                    // that assume no NaNs fold plain `fcmp ord/uno` and `fcmp
+                    // oeq x, x` to constants (upstream d5fca30, Intel Xe).
+                    // `fsrc` may give two bitcasts of one register.
+                    let same = a == b
+                        || matches!(
+                            &inst.fields,
+                            Fields::Valu(v)
+                                if v.src.len() >= 2
+                                    && v.src[0] == v.src[1]
+                                    && (v.abs & 1) == ((v.abs >> 1) & 1)
+                                    && (v.neg & 1) == ((v.neg >> 1) & 1)
+                                    && (v.opsel & 1) == ((v.opsel >> 1) & 1)
+                                    && v.sdwa.is_none()
+                                    && v.dpp.is_none()
+                        );
+                    let yes = self.s.m.bool(true);
+                    match op {
+                        "u" | "o" => {
+                            let na = self.is_nan_f32(a);
+                            let u = if same {
+                                na
+                            } else {
+                                let nb = self.is_nan_f32(b);
+                                self.s.m.bin(c, Bin::Or, na, nb)
+                            };
+                            Some(if op == "o" { self.s.m.bin(c, Bin::Xor, u, yes) } else { u })
+                        }
+                        "eq" | "le" | "ge" if same => {
+                            let n = self.is_nan_f32(a);
+                            Some(self.s.m.bin(c, Bin::Xor, n, yes))
+                        }
+                        "neq" | "nge" | "nle" if same => Some(self.is_nan_f32(a)),
+                        _ => None,
+                    }
+                } {
+                    r
                 } else {
                     let p = match op {
                         "f" => pred::FALSE,
@@ -10969,22 +11243,46 @@ impl<'a> Lower<'a> {
                 }
             }
             "u64" | "i64" => {
-                let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
+                // On the two dwords, not as i64: AMD's D3D12 shader compiler
+                // orders 64-bit integers as if their dwords were swapped
+                // (RX 9070 and gfx1036 alike; equality is unaffected), where
+                // WARP compares them right. The high dwords decide, signed
+                // for i64; equal ones leave it to the low dwords, unsigned.
+                let (alo, ahi) = self.src64_dwords(inst, 0)?;
+                let (blo, bhi) = self.src64_dwords(inst, 1)?;
                 let signed = ty == "i64";
-                let p = match op {
-                    "eq" => pred::EQ,
-                    "ne" | "lg" => pred::NE,
-                    "lt" if signed => pred::SLT,
-                    "le" if signed => pred::SLE,
-                    "gt" if signed => pred::SGT,
-                    "ge" if signed => pred::SGE,
-                    "lt" => pred::IULT,
-                    "le" => pred::IULE,
-                    "gt" => pred::IUGT,
-                    "ge" => pred::IUGE,
+                let cmp = |l: &mut Self, p, x, y| l.s.m.cmp(c, p, x, y);
+                match op {
+                    "eq" | "ne" | "lg" => {
+                        let lo = cmp(self, pred::EQ, alo, blo);
+                        let hi = cmp(self, pred::EQ, ahi, bhi);
+                        let eq = self.s.m.bin(c, Bin::And, lo, hi);
+                        if op == "eq" {
+                            eq
+                        } else {
+                            let yes = self.s.m.bool(true);
+                            self.s.m.bin(c, Bin::Xor, eq, yes)
+                        }
+                    }
+                    "lt" | "le" | "gt" | "ge" => {
+                        let (hi_p, lo_p) = match (op, signed) {
+                            ("lt", true) => (pred::SLT, pred::IULT),
+                            ("le", true) => (pred::SLT, pred::IULE),
+                            ("gt", true) => (pred::SGT, pred::IUGT),
+                            ("ge", true) => (pred::SGT, pred::IUGE),
+                            ("lt", false) => (pred::IULT, pred::IULT),
+                            ("le", false) => (pred::IULT, pred::IULE),
+                            ("gt", false) => (pred::IUGT, pred::IUGT),
+                            _ => (pred::IUGT, pred::IUGE),
+                        };
+                        let hi = cmp(self, hi_p, ahi, bhi);
+                        let hi_eq = cmp(self, pred::EQ, ahi, bhi);
+                        let lo = cmp(self, lo_p, alo, blo);
+                        let lo = self.s.m.bin(c, Bin::And, hi_eq, lo);
+                        self.s.m.bin(c, Bin::Or, hi, lo)
+                    }
                     _ => return Err("a 64-bit compare"),
-                };
-                self.s.m.cmp(c, p, a, b)
+                }
             }
             "u32" | "i32" | "u16" | "i16" => {
                 let (a, b) = if ty.ends_with("16") {

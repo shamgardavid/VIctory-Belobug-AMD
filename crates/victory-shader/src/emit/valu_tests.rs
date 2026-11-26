@@ -843,6 +843,62 @@ fn v_cmp_lg_is_false_for_nan() {
     }
 }
 
+/// 64-bit integer compares order by the high dword (signed for i64), then
+/// by the low one. AMD's D3D12 compiler runs an ordered i64 `icmp` as if the
+/// dwords were swapped (RX 9070 and gfx1036 alike), so the lowering compares
+/// the dwords; the values are picked so that the two orders disagree.
+#[test]
+fn v_cmp_u64_and_i64_order_by_the_high_dword() {
+    type Order = fn(u64, u64) -> bool;
+    let ops: [(u16, &str, Order); 12] = [
+        (0x0a1, "v_cmp_lt_i64", |a, b| (a as i64) < (b as i64)),
+        (0x0a2, "v_cmp_eq_i64", |a, b| a == b),
+        (0x0a3, "v_cmp_le_i64", |a, b| (a as i64) <= (b as i64)),
+        (0x0a4, "v_cmp_gt_i64", |a, b| (a as i64) > (b as i64)),
+        (0x0a5, "v_cmp_ne_i64", |a, b| a != b),
+        (0x0a6, "v_cmp_ge_i64", |a, b| (a as i64) >= (b as i64)),
+        (0x0e1, "v_cmp_lt_u64", |a, b| a < b),
+        (0x0e2, "v_cmp_eq_u64", |a, b| a == b),
+        (0x0e3, "v_cmp_le_u64", |a, b| a <= b),
+        (0x0e4, "v_cmp_gt_u64", |a, b| a > b),
+        (0x0e5, "v_cmp_ne_u64", |a, b| a != b),
+        (0x0e6, "v_cmp_ge_u64", |a, b| a >= b),
+    ];
+    let values: [u64; 10] = [
+        0,
+        1,
+        0xFFFF_FFFF,
+        0x1_0000_0000,
+        0x1_FFFF_FFFF,
+        0x0000_0040_C010_FBFF,
+        0x0001_8000_0000_0040,
+        0x7FFF_FFFF_FFFF_FFFF,
+        0x8000_0000_0000_0001,
+        0xFFFF_FFFF_0000_0000,
+    ];
+    let inputs: Vec<[u32; 4]> = values
+        .iter()
+        .flat_map(|&a| values.iter().map(move |&b| (a, b)))
+        .map(|(a, b)| [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32])
+        .collect();
+    for (op, name, order) in ops {
+        // op s20, v[1:2], v[3:4] and, sharing v2, op s20, v[1:2], v[2:3];
+        // v_cndmask_b32_e64 v0, 0, 1, s20
+        for second in [3, 2] {
+            let mut body = vop3(op, 20, vgpr(1), vgpr(second), 0x80).to_vec();
+            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+            let shader = build_valu_cs(&body);
+            let at = usize::from(second) - 1;
+            run_cases(&shader, &inputs, |backend, _, inp, got| {
+                let a = u64::from(inp[0]) | u64::from(inp[1]) << 32;
+                let b = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
+                let want = u32::from(order(a, b));
+                assert_eq!(got, want, "{backend}: {name}({a:#018x}, {b:#018x})");
+            });
+        }
+    }
+}
+
 #[test]
 fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
     // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
@@ -2230,4 +2286,60 @@ fn rdna_forms_give_what_the_spelled_out_ones_give() {
             assert!(same, "{name} of {:?}: {x} ({was:#x}), now {y} ({is:#x})", case.map(f32::from_bits));
         }
     }
+}
+
+/// SCC after the SOP2 `op s12, s0, s1`, read back into `v0` through
+/// `s_cselect_b32 s13, 1, 0`.
+fn scc_after(op: u8) -> HostShader {
+    build_valu_cs(&[
+        sop2(op, 12, 0, 1),
+        sop2(0x0A, 13, 129, 128), // s_cselect_b32 s13, 1, 0
+        vop1(0x001, 0, sgpr(13)), // v_mov_b32 v0, s13
+    ])
+}
+
+/// Checks the SCC that `op` leaves for each `(s0, s1, scc)`.
+fn check_scc(name: &str, op: u8, cases: &[(u32, u32, u32)]) {
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|&(a, b, _)| [a, b, 0, 0]).collect();
+    run_cases(&scc_after(op), &inputs, |backend, i, inp, got| {
+        let want = cases[i].2;
+        assert_eq!(
+            got, want,
+            "{backend}: SCC after {name}({:#010x}, {:#010x}) = {got}, want {want}",
+            inp[0], inp[1],
+        );
+    });
+}
+
+#[test]
+fn s_min_and_s_max_set_scc_when_src0_is_chosen() {
+    let m1 = (-1i32) as u32;
+    check_scc("s_min_i32", 0x06, &[(m1, 2, 1), (2, m1, 0), (4, 4, 0)]);
+    check_scc("s_min_u32", 0x07, &[(3, 5, 1), (5, 3, 0), (4, 4, 0)]);
+    check_scc("s_max_i32", 0x08, &[(2, m1, 1), (m1, 2, 0), (4, 4, 0)]);
+    check_scc("s_max_u32", 0x09, &[(5, 3, 1), (3, 5, 0), (4, 4, 0)]);
+}
+
+#[test]
+fn s_lshl_add_sets_scc_on_unsigned_overflow() {
+    // (s0 << n) + s1 past 32 bits, through the shift or through the add.
+    check_scc(
+        "s_lshl1_add_u32",
+        0x2E,
+        &[
+            (1, 2, 0),
+            (1, 0xFFFF_FFFD, 0),
+            (1, 0xFFFF_FFFE, 1),
+            (0x8000_0000, 0, 1),
+        ],
+    );
+    check_scc(
+        "s_lshl4_add_u32",
+        0x31,
+        &[
+            (0x0FFF_FFFF, 0xF, 0),
+            (0x0FFF_FFFF, 0x10, 1),
+            (0x1000_0000, 0, 1),
+        ],
+    );
 }
