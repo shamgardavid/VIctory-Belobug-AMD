@@ -151,7 +151,7 @@ pub extern "system" fn CreateWindowExA(
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
-/// chain stretches). `VICTORY_MONITOR=<n>` puts it on `\.DISPLAY<n>`.
+/// chain stretches). `VICTORY_MONITOR=<n>` puts it on `\\.\DISPLAY<n>`.
 /// `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
