@@ -2298,6 +2298,24 @@ enum Moved {
     Value(Value),
 }
 
+/// (cool_fox 8cc31ab, Scarlett's switch) `VICTORY_SPILL_STRICT` (default 1; =0: spills
+/// followed through lane moves with modifiers or lanes past the wave too, as before).
+fn spill_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SPILL_STRICT").is_none_or(|v| v != "0"))
+}
+
+fn plain_lane(v: &crate::gfx10::Valu) -> bool {
+    !spill_strict()
+        || (v.abs == 0
+            && v.neg == 0
+            && v.opsel == 0
+            && !v.clamp
+            && v.omod == 0
+            && v.sdwa.is_none()
+            && v.dpp.is_none())
+}
+
 impl Tracer<'_> {
     /// For `v_readlane_b32` of a constant lane: the SGPR spilled to that
     /// lane, found by following the VGPR's `v_writelane_b32` writes.
@@ -2305,13 +2323,17 @@ impl Tracer<'_> {
         let Fields::Valu(v) = &inst.fields else {
             return None;
         };
-        if inst.name() != "v_readlane_b32" {
+        if inst.name() != "v_readlane_b32" || !plain_lane(v) {
             return None;
         }
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
+        let lane = lane_of(lane)?;
+        if spill_strict() && lane >= if self.p.wave64 { 64 } else { 32 } {
+            return None;
+        }
+        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
             .ok()
             .flatten()
     }
@@ -2342,10 +2364,14 @@ impl Tracer<'_> {
         let (Some(Operand::Vector { reg, .. }), [value, at]) = (w.dst, &w.src[..]) else {
             return Err(());
         };
-        if inst.name() != "v_writelane_b32" {
+        if inst.name() != "v_writelane_b32" || !plain_lane(w) {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        let written = lane_of(*at).ok_or(())?;
+        if spill_strict() && written >= if self.p.wave64 { 64 } else { 32 } {
+            return Err(());
+        }
+        if written != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -2379,9 +2405,15 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         return Some(Moved::Const(i32::from((*imm)? as i16) as u32));
     }
     // A mask of S0 bits from bit S1, as the upscaler's compiler makes an
-    // immediate sampler's word.
-    if let ("s_bfm_b32", 0, [Operand::Const(w), Operand::Const(at)]) = (inst.name(), k, &src[..]) {
-        let (w, at) = (inline(*w)? & 31, inline(*at)? & 31);
+    // immediate sampler's word (inline constants or 32-bit literals).
+    if let ("s_bfm_b32", 0) = (inst.name(), k) {
+        let constant = |o: &Operand| match *o {
+            Operand::Const(c) => inline(c),
+            Operand::Literal(x) => Some(x),
+            _ => None,
+        };
+        let w = constant(src.first()?)? & 31;
+        let at = constant(src.get(1)?)? & 31;
         return Some(Moved::Const(((1u32 << w) - 1) << at));
     }
     let src = src.first()?;
@@ -2976,6 +3008,52 @@ pub(crate) mod tests {
         assert_eq!(value(1, 0), Term::Const(0x00FF_F000));
         assert_eq!(value(2, 0), Term::Const(0x1850_0000));
         assert_eq!(value(2, 1), Term::Const(0));
+    }
+
+    /// (Scarlett) An `s_bfm_b32` whose width is a 32-bit literal is a
+    /// constant too, as with inline constants.
+    #[test]
+    fn a_bit_mask_from_a_literal_width_is_a_constant() {
+        let code: Vec<u8> = [
+            0x9211_8CFF,
+            0x0000_0014, // s_bfm_b32 s17, 0x14, 12
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w: &u32| w.to_le_bytes())
+        .collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 4, 1)];
+        let t = Tracer::new(&p, &layout, HwStage::Cs, None).unwrap();
+        let value = t.origin(p.blocks[0].insts[0].writes[0].1);
+        assert_eq!(value, Term::Const(0xFFFF_F000), "the literal width was not resolved");
+    }
+
+    /// (cool_fox 8cc31ab, `VICTORY_SPILL_STRICT`) A lane past a wave32's 32 is
+    /// not one a spilled SGPR is followed through (=0: followed, as before).
+    /// The VGPR is read as a vector too, so `ir::build` leaves the lanes to
+    /// the tracer instead of making them moves.
+    #[test]
+    fn spilled_sgprs_are_not_followed_through_lanes_past_the_wave() {
+        let run = |lane: u32| {
+            let words = [
+                    0xD761_0000,
+                    0x0001_0009 | (128 + lane) << 9, // v_writelane_b32 v0, s9, lane
+                    0xD760_0002,
+                    0x0001_0100 | (128 + lane) << 9, // v_readlane_b32 s2, v0, lane
+                    0xBE83_0380, // s_mov_b32 s3, 0
+                    0xF40C_0001,
+                    0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                    0x7E02_0300, // v_mov_b32 v1, v0
+                    S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, false, 256).unwrap();
+            track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).map(|r| r.scalar)
+        };
+        assert_eq!(run(3), Ok(vec![((0, 3), at(0, 0x20))]), "a lane in the wave is not followed");
+        // Not followed, the address is no root parameter's: the program is refused.
+        assert!(run(40).is_err(), "the spill was followed through lane 40 of a wave32: {:?}", run(40));
     }
 
 

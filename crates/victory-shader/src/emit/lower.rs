@@ -1700,6 +1700,44 @@ fn packed_half(
     })
 }
 
+/// (Scarlett, myokex c3723f3) Whether a pixel program asks for the depth test before it runs
+/// (DB_SHADER_CONTROL bit 12, HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
+/// ForceEarlyDepthStencil). Without it the host tests after the shader, and a program that
+/// writes unordered views writes them for pixels the depth test then rejects: the title's glass
+/// prepass wrote its depth and motion for every pixel of a window pane, the character standing
+/// in front of it too. Not for a program that exports depth, stencil or coverage (bits 0-2 and
+/// 8, or such an output), which cannot test before it runs.
+pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
+    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
+    const EXPORTS: u32 = 0b111 | 1 << 8;
+    let StageIo::Ps { db_shader_control, .. } = io else {
+        return false;
+    };
+    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage, SV_StencilRef.
+    db_shader_control & DEPTH_BEFORE_SHADER != 0
+        && db_shader_control & EXPORTS == 0
+        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
+}
+
+/// `VICTORY_EARLY_DEPTH=0`: [`early_depth`] is never declared.
+fn early_depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+}
+
+/// (Scarlett) `VICTORY_D16_BITS` (default 1; =0 as before): d16 image loads and gathers
+/// through views of integer formats keep their 16 bits ([`Lower::d16_bits`]).
+fn d16_bits_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_BITS").is_none_or(|v| v != "0"))
+}
+
+/// (Neptune 25fbf69, Scarlett) `VICTORY_NAN_GUARD` (on unless `0`).
+fn nan_guard_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0"))
+}
+
 /// The pixel inputs packing two 16-bit rows per dword, as (first row,
 /// second row) ([`packed_layout`]).
 fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
@@ -1805,6 +1843,9 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -7987,6 +8028,52 @@ impl<'a> Lower<'a> {
         (kind == Some(ResourceType::Uav)).then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
     }
 
+    /// (Neptune 25fbf69, Scarlett) A float a pixel program exports to a colour target, with
+    /// NaN made 0 and an infinity +-65504, so one bad pixel does not stay in a history the
+    /// title blends into each frame (glowing eyes, white shots).
+    fn nan_guard(&mut self, f: V) -> V {
+        if !nan_guard_on() {
+            return f;
+        }
+        let c = self.cur;
+        let bits = self.as_int(f);
+        let mag = self.s.m.i32(0x7FFF_FFFF);
+        let abs = self.s.m.bin(c, Bin::And, bits, mag);
+        let inf_bits = self.s.m.i32(0x7F80_0000);
+        let nan = self.s.m.cmp(c, pred::IUGT, abs, inf_bits);
+        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
+        let sign_bit = self.s.m.i32(0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
+        let big = self.s.m.i32(65504f32.to_bits());
+        let big = self.s.m.bin(c, Bin::Or, sign, big);
+        let zero = self.s.m.i32(0);
+        let r = self.s.m.select(c, inf, big, bits);
+        let r = self.s.m.select(c, nan, zero, r);
+        self.as_float(r)
+    }
+
+    /// (Scarlett, `VICTORY_D16_BITS`) A d16 load's 16 bits from `x`, the 32-bit value a
+    /// float-typed image load returned. Through a view of an integer format the host passes
+    /// the integer's bits unconverted: a 16-bit unsigned (or non-negative signed) value is a
+    /// tiny denormal there (bits up to 0xFFFF), a negative signed one sign-extended (bits
+    /// from 0xFFFF8000), and the console's d16 load gives its low 16 bits; converting them as
+    /// a float gave 0 (or NaN). Every other value is converted to a half as before.
+    fn d16_bits(&mut self, x: V) -> V {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let half = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x]);
+        if !d16_bits_on() {
+            return half;
+        }
+        let bits = self.as_int(x);
+        let (top, neg) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_7FFF));
+        let small = self.s.m.cmp(c, pred::IULE, bits, top);
+        let negative = self.s.m.cmp(c, pred::IUGT, bits, neg);
+        let integer = self.s.m.bin(c, Bin::Or, small, negative);
+        let low = self.s.m.bin(c, Bin::And, bits, top);
+        self.s.m.select(c, integer, low, half)
+    }
+
     /// The used-resource entry a descriptor loaded from a table falls in.
     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
@@ -12464,11 +12551,16 @@ impl<'a> Lower<'a> {
                 None => self.s.m.extract(c, r, ch),
             };
             xs.push(if *d16 {
-                // shortcut: d16 results are taken as floats (rounded to
-                // nearest even); integer formats would keep 16 bits.
-                let i32t = self.s.t.i32;
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                // d16 results are taken as floats (rounded to nearest even); (Scarlett) a
+                // load or gather through an integer view keeps its 16 bits ([`Self::d16_bits`]).
+                // shortcut: samples are always floats.
+                if matches!(op, 66 | 73) {
+                    self.d16_bits(x)
+                } else {
+                    let i32t = self.s.t.i32;
+                    self.s
+                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
+                }
             } else {
                 self.as_int(x)
             });
@@ -13272,9 +13364,13 @@ impl<'a> Lower<'a> {
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
                 x = self.as_int(f);
             }
+            let pixel = self.s.pixel;
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            // (Neptune) A pixel program's float colour target (`VICTORY_NAN_GUARD`).
+            let (kind, comp) = (el.kind, el.comp);
+            let target = !mesh && pixel && kind == 16 && comp == 9;
+            let (suffix, x) = match comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -13285,6 +13381,7 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            let x = if target { self.nan_guard(x) } else { x };
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),

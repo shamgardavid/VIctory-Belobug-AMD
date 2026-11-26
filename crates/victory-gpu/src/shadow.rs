@@ -671,7 +671,7 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
 pub(crate) fn stale_pages(most: usize, say: &mut dyn FnMut(&Shadow, usize, usize, (usize, u32, u32))) -> usize {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
-    all.extend(LOOSE.write().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    all.extend(LOOSE.read().unwrap_or_else(|e| e.into_inner()).values().cloned());
     all.retain(|s| s.place.is_none() && s.watched.load(Ordering::Relaxed) == 1);
     all.sort_by_key(|s| s.id);
     let next = NEXT.load(Ordering::Relaxed);
@@ -2900,7 +2900,7 @@ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 #[cfg(feature = "diagnostics")]
 pub(crate) fn windows() -> [u64; 3] {
     let asked: u64 = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         loose
             .values()
             .map(|s| {
@@ -2924,7 +2924,7 @@ pub(crate) fn windows() -> [u64; 3] {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_use() -> [u64; 8] {
     let mut out = [0u64; 8];
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     for s in loose.values() {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
@@ -3076,7 +3076,7 @@ pub(crate) fn let_go_idle() {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn memory() -> [u64; 6] {
     let (windows, window_bytes) = {
-        let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
         // Each copy once: a window may stand under several keys.
         let mut seen = std::collections::HashSet::new();
         let bytes: u64 = loose
@@ -5168,7 +5168,7 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
 /// bytes, true).
 pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
     let mut spans: Vec<(u64, u64, bool)> = buffers_read().iter().map(|(key, entry)| (key.0, entry.end - key.0, false)).collect();
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     spans.extend(loose.keys().map(|&(start, len)| (start, len, true)));
     spans
 }
@@ -5419,7 +5419,7 @@ fn fine() -> bool {
 /// which is copied once for each.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn window_cover() -> u64 {
-    let loose = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     cover(loose.keys().copied())
 }
 
@@ -5529,12 +5529,110 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     Some(shadow)
 }
 
+/// The most an ask without a length (a root view) is given past its 4 MiB
+/// cell, in bytes: `VICTORY_ROOT_WINDOW_MB` (32; 4 = the cell alone, as
+/// before), in whole cells.
+fn root_window_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        let mb = std::env::var("VICTORY_ROOT_WINDOW_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
+        (mb.unwrap_or(32).clamp(4, 256) << 20) / WINDOW * WINDOW
+    })
+}
+
+/// The window of an ask without a length at `[address, end)`: its 4 MiB
+/// cell, and on past it while the title's memory stays committed, up to
+/// [`root_window_most`].
+///
+/// A root view has no size, and the shader reads on from its address
+/// through the copy it was given. Held to its cell, a view into a big
+/// allocation outside any buffer object (a 12 MB vertex pool, say) read
+/// past the end of its 4 MiB window into whatever the host had placed
+/// after it: in the intro (DRED, RX 7900 XT) the card faulted 0xbfd000
+/// bytes into the window of title 0xcae400000, at memory freed texture
+/// staging had held, and the device was removed. The memory the title
+/// committed around the view is what it can be reading.
+fn root_window(address: u64, end: u64) -> (u64, u64) {
+    let (cell, len) = window_of(address, end, WINDOW);
+    let most = root_window_most();
+    if most <= len {
+        return (cell, len);
+    }
+    root_extent(cell, len, recent_reach(cell + len, cell + most), most)
+}
+
+/// How long a [`committed_reach`] answer is used again, in milliseconds
+/// (`VICTORY_ROOT_REACH_MS`, 1000; 0: asked every time).
+///
+/// Every ask without a length asked Windows anew, from the threads that
+/// translate list calls, while the title maps and unmaps its pages: 680
+/// queries in 8 frames of driving took 362 ms of those threads (65 us to
+/// 5.7 ms each; 330,000 regions in the address space). What the title
+/// commits around a root view changes far less often than it is asked.
+fn root_reach_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_ROOT_REACH_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1000))
+}
+
+/// [`committed_reach`], answered from what was found for the same range in
+/// the last [`root_reach_ms`].
+fn recent_reach(from: u64, limit: u64) -> u64 {
+    type Found = std::collections::HashMap<(u64, u64), (u64, std::time::Instant)>;
+    static FOUND: std::sync::LazyLock<std::sync::RwLock<Found>> = std::sync::LazyLock::new(Default::default);
+    let ms = root_reach_ms();
+    if ms == 0 {
+        return committed_reach(from, limit);
+    }
+    let fresh = std::time::Duration::from_millis(ms);
+    if let Some(&(reach, at)) = FOUND.read().unwrap_or_else(|e| e.into_inner()).get(&(from, limit))
+        && at.elapsed() < fresh
+    {
+        return reach;
+    }
+    let reach = committed_reach(from, limit);
+    let mut found = FOUND.write().unwrap_or_else(|e| e.into_inner());
+    if found.len() >= 4096 {
+        found.retain(|_, (_, at)| at.elapsed() < fresh);
+    }
+    found.insert((from, limit), (reach, std::time::Instant::now()));
+    reach
+}
+
+/// The window from `cell` of at least `len` bytes that reaches `reach`,
+/// rounded up to whole cells and held to `most` bytes.
+fn root_extent(cell: u64, len: u64, reach: u64, most: u64) -> (u64, u64) {
+    let end = reach.next_multiple_of(WINDOW).min(cell + most).max(cell + len);
+    (cell, end - cell)
+}
+
+/// Where the title's committed memory that runs on from `from` ends, looked
+/// at no further than `limit` (`from` itself if `from` is not committed).
+fn committed_reach(from: u64, limit: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut at = from;
+    while at < limit {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query of our own address space into `info`.
+        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != MEM_COMMIT || info.RegionSize == 0 {
+            break;
+        }
+        at = info.BaseAddress as u64 + info.RegionSize as u64;
+    }
+    at.min(limit)
+}
+
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), Arc<Shadow>>> = std::sync::RwLock::new(BTreeMap::new());
 
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let (cell, _) = window_of(address, end, WINDOW);
-    let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
+    let named = if unsized_ask && !tails() {
+        root_window(address, end)
+    } else {
+        window_of(address, end, if unsized_ask { WINDOW } else { window() })
+    };
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         // (Read first: the lines are shared by all recording threads.)
@@ -5553,9 +5651,23 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         }
     };
     // The window is there already (nearly always): readers share the lock.
-    if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
+    // Also when windows are finer than their cell (`fine`) and the ask takes
+    // any that holds it: that search was made under the write lock only, so
+    // every such ask stood in one line (`VICTORY_WINDOW_KB=1024`: 1.4 s of
+    // waits in 4 frames of driving, run t-tl1, all threads). The write lock
+    // is for making one.
+    {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
+        let key = if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end)
+        } else if any && fine() && !unsized_ask {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            Some(holder(there, address, end).unwrap_or(named))
+        } else {
+            Some(named)
+        };
+        if let Some(shadow) = key.and_then(|key| map.get(&key)) {
             note(shadow);
             return Some(shadow.clone());
         }
@@ -5874,6 +5986,75 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+
+    /// A root view's window reaches as far as the memory around it, in
+    /// whole cells, never less than its cell and never past the most.
+    #[test]
+    fn root_windows_reach_the_committed_memory() {
+        use super::root_extent;
+        let cell = 0xcae4_00000u64;
+        let most = 32 << 20;
+        assert_eq!(root_extent(cell, WINDOW, cell + WINDOW, most), (cell, WINDOW));
+        assert_eq!(root_extent(cell, WINDOW, cell + 0xbfd000 + 1, most), (cell, 12 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (12 << 20) + 1, most), (cell, 16 << 20));
+        assert_eq!(root_extent(cell, WINDOW, cell + (1 << 30), most), (cell, most));
+        assert_eq!(root_extent(cell, 2 * WINDOW, cell + WINDOW, most), (cell, 2 * WINDOW));
+    }
+
+    /// The reach of committed memory stops where the commitment does.
+    #[test]
+    fn committed_reach_stops_at_the_end_of_committed_memory() {
+        use super::committed_reach;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // SAFETY: a fresh reservation of our own, freed below.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 16 << 20, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        // SAFETY: inside the reservation just made.
+        let done = unsafe { VirtualAlloc(base as *const _, 12 << 20, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        assert_eq!(committed_reach(base, base + (16 << 20)), base + (12 << 20));
+        assert_eq!(committed_reach(base, base + (8 << 20)), base + (8 << 20));
+        assert_eq!(committed_reach(base + (12 << 20), base + (16 << 20)), base + (12 << 20));
+        // SAFETY: our own reservation, nothing else uses it.
+        assert_ne!(unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) }, 0);
+    }
+
+    /// A 4 MiB cell of a fresh reservation, with `committed` bytes of it
+    /// committed from the cell on (the reservation stays; the test owns it).
+    fn committed_cell(committed: u64) -> u64 {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        // SAFETY: a fresh reservation of our own; one cell of slack to align.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), (40 << 20) as usize, MEM_RESERVE, PAGE_READWRITE) } as u64;
+        assert_ne!(base, 0);
+        let cell = base.next_multiple_of(WINDOW);
+        // SAFETY: inside the reservation just made.
+        let done = unsafe { VirtualAlloc(cell as *const _, committed as usize, MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!done.is_null());
+        cell
+    }
+
+    /// A root view into 12 MiB of committed memory is given a window over
+    /// all of it, not its 4 MiB cell alone (`VICTORY_ROOT_WINDOW_MB=4`: the
+    /// cell, as before).
+    #[test]
+    fn a_root_view_window_covers_the_memory_committed_after_its_cell() {
+        let cell = committed_cell(12 << 20);
+        assert_eq!(super::root_window(cell + 0x100, cell + 0x104), (cell, 12 << 20), "the root view's window is its cell alone");
+    }
+
+    /// What was found committed around a root view is used again within
+    /// `VICTORY_ROOT_REACH_MS` (=0: asked anew every time).
+    #[test]
+    fn a_root_view_reach_is_used_again_within_its_time() {
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
+        let cell = committed_cell(12 << 20);
+        assert_eq!(super::root_window(cell, cell + 4), (cell, 12 << 20));
+        // SAFETY: the upper 8 MiB of our own commitment, nothing reads it.
+        assert_ne!(unsafe { VirtualFree((cell + WINDOW) as *mut _, (8 << 20) as usize, MEM_DECOMMIT) }, 0);
+        assert_eq!(super::root_window(cell, cell + 4), (cell, 12 << 20), "the reach was asked of Windows again");
     }
 }
 
