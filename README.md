@@ -1,7 +1,26 @@
-# VIctory on an RX 7900 XTX
+# VIctory on an RX 7700 XT
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+A compatibility layer that runs an Xbox Series title natively on Windows from
+files the user supplies, tuned for an AMD RX 7700 XT with 32 GB of RAM.
+
+## Credits
+
+This repository builds on other people's work, with their full git history kept
+so every commit stays credited to its author:
+
+- [Marvisak/VIctory](https://github.com/Marvisak/VIctory): the original project.
+- [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD):
+  the AMD fork, whose `rx9070xt` branch this one starts from.
+- [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX) and
+  its contributors' pull requests (renderer ports, speed, memory and picture fixes),
+  codec-d/cool_fox, DexNom/VIctory (FidelityFX 4.1.2) and others named in the
+  commit messages.
+
+Licensed under the GNU GPL v3, as the projects it comes from ([LICENSE](LICENSE)).
+
+The rest of this file is the upstream README with a section for this machine.
+
+# VIctory on an RX 7900 XTX (upstream)
 
 ## The goal
 
