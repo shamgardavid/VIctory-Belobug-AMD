@@ -11123,6 +11123,45 @@ impl<'a> Lower<'a> {
                     let lt = self.s.m.cmp(c, pred::OLT, a, b);
                     let gt = self.s.m.cmp(c, pred::OGT, a, b);
                     self.s.m.bin(c, Bin::Or, lt, gt)
+                } else if let Some(r) = {
+                    // Ordered/unordered tests, and self compares that only a NaN
+                    // decides, through `is_nan_f32` (integer arithmetic): drivers
+                    // that assume no NaNs fold plain `fcmp ord/uno` and `fcmp
+                    // oeq x, x` to constants (upstream d5fca30, Intel Xe).
+                    // `fsrc` may give two bitcasts of one register.
+                    let same = a == b
+                        || matches!(
+                            &inst.fields,
+                            Fields::Valu(v)
+                                if v.src.len() >= 2
+                                    && v.src[0] == v.src[1]
+                                    && (v.abs & 1) == ((v.abs >> 1) & 1)
+                                    && (v.neg & 1) == ((v.neg >> 1) & 1)
+                                    && (v.opsel & 1) == ((v.opsel >> 1) & 1)
+                                    && v.sdwa.is_none()
+                                    && v.dpp.is_none()
+                        );
+                    let yes = self.s.m.bool(true);
+                    match op {
+                        "u" | "o" => {
+                            let na = self.is_nan_f32(a);
+                            let u = if same {
+                                na
+                            } else {
+                                let nb = self.is_nan_f32(b);
+                                self.s.m.bin(c, Bin::Or, na, nb)
+                            };
+                            Some(if op == "o" { self.s.m.bin(c, Bin::Xor, u, yes) } else { u })
+                        }
+                        "eq" | "le" | "ge" if same => {
+                            let n = self.is_nan_f32(a);
+                            Some(self.s.m.bin(c, Bin::Xor, n, yes))
+                        }
+                        "neq" | "nge" | "nle" if same => Some(self.is_nan_f32(a)),
+                        _ => None,
+                    }
+                } {
+                    r
                 } else {
                     let p = match op {
                         "f" => pred::FALSE,
