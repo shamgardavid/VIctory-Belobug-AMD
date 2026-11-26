@@ -97,6 +97,20 @@ Kept up to date during the investigation. Newest findings at the end of each sec
 - Also done: `pack\story000\story000.rpf` in the (fixed) folder is now the plain
   archive (wrapped header stripped); the wrapped original stays in the original folder.
 
+## After a full navmeshes.rpf (2026-11-26, afternoon)
+
+- A fresh `navmeshes.rpf` (6,707,512,496 bytes, not a 64 KiB multiple) gets past the
+  hang: the game shows ROCKSTAR GAMES LEGAL TERMS & POLICIES next. Tick both boxes
+  (Privacy Policy and Terms of Service, Enter on each) and Confirm. It then opens the
+  story packs (story000*, shared_minigame000*) and reaches `Game State: Game Running`.
+- About 5 s later it stops itself (`0x80000003` at `+0x29defb1`, a status check).
+  DirectStorage failure logs now name the file: a ZLIB request at offset
+  20,022,473,968 in `pack\story000\story000.rpf`, which is only 16,577,789,568 bytes
+  (`0x80070026`, end of file). So **story000.rpf is cut short as well**; the
+  "length minus header is 16-byte aligned" test that called it complete was wrong.
+- Lesson: file sizes alone cannot prove a copy is complete. The only reliable check is
+  the size the Xbox reports for each file, or the game reading every entry.
+
 ## Leads
 
 - Marvisak/VIctory#1063: same loader; on GTX 1660 it stops at `+0x1330a44` (codec
