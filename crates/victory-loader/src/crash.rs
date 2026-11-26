@@ -605,13 +605,30 @@ pub(crate) struct Aligned16(pub(crate) CONTEXT);
 /// pushes no more than `MAX_FRAMES`, so it does not allocate when `frames`
 /// has that capacity (another thread may be suspended holding the heap).
 pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mut Vec<u64>) {
+    unwind_each(context, low, high, |c| {
+        frames.push(c.Rip);
+        frames.len() < MAX_FRAMES
+    });
+}
+
+/// Calls `each` with the context of every frame, the registers a callee
+/// saves restored to the caller's, until it returns false or the stack
+/// ends. Allocates nothing itself.
+pub(crate) fn unwind_each(
+    context: CONTEXT,
+    low: usize,
+    high: usize,
+    mut each: impl FnMut(&CONTEXT) -> bool,
+) {
     // `RtlVirtualUnwind` writes the context with 16-byte aligned stores, and
     // windows-sys declares `CONTEXT` without that alignment: a by-value copy on
     // the stack can land 8 bytes off and fault (seen in a debug build).
     let mut aligned = Aligned16(context);
     let context = &mut aligned.0;
-    frames.push(context.Rip);
-    while frames.len() < MAX_FRAMES {
+    if !each(context) {
+        return;
+    }
+    loop {
         // Stop where reading the stack would fault inside this handler.
         let rsp = context.Rsp as usize;
         if rsp < low || rsp + 8 > high {
@@ -640,10 +657,9 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
                 )
             };
         }
-        if context.Rip == 0 {
+        if context.Rip == 0 || !each(context) {
             break;
         }
-        frames.push(context.Rip);
     }
 }
 
