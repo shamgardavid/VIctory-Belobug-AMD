@@ -20,7 +20,58 @@ lighting that is too bright or too dark when walking indoors are next in line.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-26)
+## This fork's machine: RX 7700 XT, 31 GB RAM (branch `rx9070xt-speed`)
+
+Belobug's `rx9070xt` branch plus a few changes for this PC: `VICTORY_MONITOR`,
+PlayStation pads, the live key file for driving runs, stack-dump helpers. The
+running notes of how it got here are in
+[docs/investigation-rx7700xt.md](docs/investigation-rx7700xt.md).
+
+| | |
+|---|---|
+| PC | Windows 11, Ryzen 5 7600X, 31 GB RAM, Radeon RX 7700 XT (12 GB), two monitors |
+| Title | build 1.0.2.1 (the emulator prints `build Series 1.0.2.1`); the untouched executable's BLAKE3 starts `b99f876b74d4a77f` |
+| Where it stands (2026-11-26) | boots, menus, the opening cutscenes and walking around in the world; about 16-21 fps in the world once the pipelines are built, 3 fps while new ones are being made |
+| Picture | still wrong in places: dark brown haze, horizontal streaks, speckled surfaces |
+
+**Game files must be complete.** A copy over a bad USB stick cut files short at
+64 KiB boundaries and the title hung or stopped with nothing on screen to say
+why; see the notes. Copy the whole folder in one go from the console.
+
+### First time (once per build or driver update)
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+```
+
+Translate every shader into the cache (about 4 minutes; `VICTORY_PORT_CBV=1`
+must match how you play, it is part of the cache key):
+
+```powershell
+$env:VICTORY_PORT_CBV='1'; target\diag\victory.exe shaders 'D:\GTA 6 game files\GTA 6\GTA6'
+```
+
+Play once with `-More @{VICTORY_PIPELINE_BOOK='1'}` added to the command below
+(it writes down every pipeline the title makes), then build them all into the
+driver's cache (about 15 minutes for 84,000):
+
+```powershell
+$env:VICTORY_PORT_CBV='1'; target\diag\victory.exe warm
+```
+
+### Playing
+
+```powershell
+scripts\play.ps1 -Exe 'D:\GTA 6 game files\GTA 6\GTA6\game_scarlett_master.exe' -Console series-s -More @{VICTORY_PORT_CONSTANTS='1'; VICTORY_PORT_DESCRIPTORS='1'; VICTORY_PORT_CBV='1'; VICTORY_PORT_GUARD='1'; VICTORY_PORT_JOURNAL='1'; VICTORY_RESIDENCY='1'; VICTORY_LEVELS_ON_DEMAND='1'; VICTORY_MONITOR='2'}
+```
+
+- `VICTORY_MONITOR='2'` puts the window on the second display (`\\.\DISPLAY2`); leave it out for the main one.
+- Series S profile: 1080p and lighter settings; the Series X profile was about 0.3 fps here before the shader and pipeline caches.
+- Controllers: an Xbox pad, or a PS4/PS5 pad (USB or Bluetooth; Cross = A, Circle = B, Square = X, Triangle = Y, L2/R2 = triggers, Options = Menu). The game window must have focus. `VICTORY_NO_PADS=1` ignores them.
+- Keyboard (stand-in pad): W/A/S/D left stick, I/J/K/L right stick, Z/C triggers, Q/E bumpers, Enter A, Backspace B, X, Y, arrows d-pad, Esc menu, Tab view, F/H stick clicks.
+- First boot: Enter through the narration prompt, intro and brightness and "finish setup"; on Legal Notices press Down, wait about 7 seconds, Down, Enter; on Legal Terms tick both boxes (Enter on each) and Confirm. Later boots go straight to the start screen (A).
+
+## Where it stands upstream (2026-11-26)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
 RX 7900 XTX, ray tracing off.
