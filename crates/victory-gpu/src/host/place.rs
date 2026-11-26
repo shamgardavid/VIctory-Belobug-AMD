@@ -281,7 +281,16 @@ impl HostList {
             },
             (None, None) => return false,
         }
-        unsafe { wait_for_all(host, &self.list) };
+        // The copy promoted the destination to `COPY_DEST`, and a promoted
+        // write state lasts to the end of the `ExecuteCommandLists`: a root
+        // view of it later in the list (or a later list of the call) was
+        // invalid (debug layer id 538, Belobug #350). Back to the common
+        // state, the next use promotes it again. (A valid copy leaves it in
+        // exactly `COPY_DEST`: write states are not combined.)
+        unsafe {
+            self.list.ResourceBarrier(&[transition(&to.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON)]);
+            wait_for_all(host, &self.list);
+        }
         STATS[0].fetch_add(1, Ordering::Relaxed);
         STATS[1].fetch_add(len as u64, Ordering::Relaxed);
         to.gpu_writes(self, dst as u64, len as u64);
