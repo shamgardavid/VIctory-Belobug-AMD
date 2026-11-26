@@ -5568,8 +5568,18 @@ impl<'a> Lower<'a> {
             let at = self.s.m.bin(c, Bin::Add, at, o);
             let two = self.s.m.i32(2);
             let src = self.s.m.bin(c, Bin::LShr, at, two);
-            let last = self.s.m.i32(self.wave() - 1);
-            let src = self.s.m.bin(c, Bin::And, src, last);
+            // Within the lane's own 32-lane half (RDNA 2 ISA, section
+            // 10.4.4: wave64 permutes lanes 0..31 and 32..63 independently).
+            let mask31 = self.s.m.i32(31);
+            let src = self.s.m.bin(c, Bin::And, src, mask31);
+            let src = if self.x.native.wave64 {
+                let me = self.lane_index();
+                let not31 = self.s.m.i32(!31);
+                let base = self.s.m.bin(c, Bin::And, me, not31);
+                self.s.m.bin(c, Bin::Or, base, src)
+            } else {
+                src
+            };
             let x = match guard {
                 Some(g) => {
                     let z = self.s.m.i32(0);
