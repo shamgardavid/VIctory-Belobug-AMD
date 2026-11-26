@@ -180,6 +180,33 @@ fn registers_at(thread: HANDLE) {
         for (name, value) in regs {
             eprintln!("      {name} {value:#x}{}", peek(value as usize));
         }
+        // `VICTORY_STACK_PEEK=rsi+0x10018,...`: memory at a register plus
+        // an offset (hex), with the same one-level look through.
+        // `rbx+8>0x50>0`: each `>` reads the word at the address so far and
+        // adds the next offset to it (a chain of fields through pointers).
+        for spec in std::env::var("VICTORY_STACK_PEEK").unwrap_or_default().split(',') {
+            let Some((reg, rest)) = spec.trim().split_once('+') else {
+                continue;
+            };
+            let Some(&(_, base)) = regs.iter().find(|(n, _)| *n == reg) else {
+                continue;
+            };
+            let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+            let mut steps = rest.split('>');
+            let Some(mut at) = steps.next().and_then(hex).map(|o| base.wrapping_add(o)) else {
+                continue;
+            };
+            let mut ok = true;
+            for step in steps {
+                match (read_word(at as usize), hex(step)) {
+                    (Some(p), Some(o)) => at = p.wrapping_add(o),
+                    _ => ok = false,
+                }
+            }
+            if ok {
+                eprintln!("      [{spec}] {at:#x}{}", peek(at as usize));
+            }
+        }
     }
 }
 
