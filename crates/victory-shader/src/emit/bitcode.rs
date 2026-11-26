@@ -239,46 +239,6 @@ impl Module {
         Ty(t)
     }
 
-    #[cfg(test)]
-    pub(crate) fn uses_of(&self, target: V) -> usize {
-        let mut n = 0;
-        let mut count = |v: V| {
-            if v == target {
-                n += 1;
-            }
-        };
-        for inst in &self.insts {
-            match &inst.op {
-                Op::Bin(_, a, b) | Op::Cmp(_, a, b) | Op::Store(a, b) => {
-                    count(*a);
-                    count(*b);
-                }
-                Op::Cast(_, a) | Op::Extract(a, _) | Op::Load(a) => count(*a),
-                Op::AtomicRmw(_, c, t) => {
-                    count(*c);
-                    count(*t);
-                }
-                Op::Select(c, t, f) | Op::CmpXchg(c, t, f) => {
-                    count(*c);
-                    count(*t);
-                    count(*f);
-                }
-                Op::Call(_, args) => args.iter().for_each(|&v| count(v)),
-                Op::Phi(incoming) => incoming.iter().for_each(|&(v, _)| count(v)),
-                Op::Gep(_, base, idx) => {
-                    count(*base);
-                    idx.iter().for_each(|&v| count(v));
-                }
-            }
-        }
-        for block in &self.blocks {
-            if let Some(Term::CondBr(cond, _, _)) = block.term {
-                count(cond);
-            }
-        }
-        n
-    }
-
     pub fn void(&mut self) -> Ty {
         self.ty(TypeDef::Void)
     }
