@@ -813,6 +813,7 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             intermediate_size = request.intermediate_size,
             tag = request.tag,
             name = text(request.name),
+            file = source_path(request),
             hr = format_args!("{:#010x}", hr as u32),
             "dstorage: request failed: {why}"
         );
@@ -927,6 +928,29 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
 
 /// Nanoseconds workers spent reading files, for the debug summary.
 static READING: AtomicU64 = AtomicU64::new(0);
+
+/// The host path of a request's source file, and its size, for failure
+/// logs ("memory" for a memory source).
+fn source_path(request: &Request) -> String {
+    use std::os::windows::io::AsRawHandle;
+    if request.options & MEMORY_SOURCE != 0 || request.source.is_null() {
+        return "memory".into();
+    }
+    // SAFETY: a file object we created; the title keeps it open.
+    let file = &unsafe { &*request.source.cast::<Instance<File>>() }.state.file;
+    let mut path = [0u16; 512];
+    // SAFETY: room for 512 characters.
+    let used = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW(
+            file.as_raw_handle(),
+            path.as_mut_ptr(),
+            path.len() as u32,
+            0,
+        )
+    } as usize;
+    let size = file.metadata().map_or(0, |m| m.len());
+    format!("{} ({size} bytes)", String::from_utf16_lossy(&path[..used.min(path.len())]))
+}
 
 /// Fills `out` (the source size) from the request's file or memory.
 fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
