@@ -392,8 +392,104 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Loops lanes leave through one block, by that block: the header and the scalar values
+    /// the loop writes that code after it reads ([`loop_exits`], [`Lower::leave_loops`]).
+    loop_exits: HashMap<usize, Vec<(usize, Vec<Value>)>>,
+    /// Loop bodies (IR blocks) by header.
+    loop_bodies: HashMap<usize, HashSet<usize>>,
+    /// Scalar values as the wave's last iteration of a divergent loop left them, with the
+    /// loop's header: what code after the loop reads.
+    finals: HashMap<Value, (Val, usize)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+}
+
+/// The program's natural loops (headers: blocks with a back edge in reverse postorder, as
+/// [`Lower`]'s iteration counters have them), by header, and for each divergent loop (a lane
+/// branch leaves it or goes round it) that lanes leave through one block (every edge into it
+/// from the loop) the scalar values written in the loop that code after it reads, by that
+/// block.
+#[allow(clippy::type_complexity)]
+fn loop_exits(
+    p: &Program,
+    st: &Structured,
+) -> (HashMap<usize, Vec<(usize, Vec<Value>)>>, HashMap<usize, HashSet<usize>>) {
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let mut rpo = vec![usize::MAX; p.blocks.len()];
+    for (n, &b) in order.iter().enumerate() {
+        rpo[b] = n;
+    }
+    let reachable = |q: usize| rpo[q] != usize::MAX;
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); p.blocks.len()];
+    for &b in &order {
+        for &q in p.blocks[b].preds.iter().filter(|&&q| reachable(q)) {
+            succs[q].push(b);
+        }
+    }
+    let scalar = |r: Reg| match r {
+        Reg::S(c) => c != EXEC && c != EXEC + 1,
+        Reg::Scc => true,
+        _ => false,
+    };
+    let (mut exits, mut bodies) = (HashMap::new(), HashMap::new());
+    for &h in &order {
+        let mut work: Vec<usize> = p.blocks[h]
+            .preds
+            .iter()
+            .copied()
+            .filter(|&q| reachable(q) && rpo[h] <= rpo[q])
+            .collect();
+        if work.is_empty() {
+            continue;
+        }
+        let mut body: HashSet<usize> = HashSet::from([h]);
+        while let Some(q) = work.pop() {
+            if body.insert(q) {
+                work.extend(p.blocks[q].preds.iter().copied().filter(|&r| reachable(r)));
+            }
+        }
+        let mut out: Vec<usize> =
+            body.iter().flat_map(|&b| succs[b].iter().copied()).filter(|t| !body.contains(t)).collect();
+        out.sort_unstable();
+        out.dedup();
+        let per_lane = |b: usize| {
+            !st.wide.contains(&b)
+                && matches!(st.exits[b], LaneExit::Branch { when, .. }
+                    if !st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_))))
+        };
+        if let [e] = out[..]
+            && p.blocks[e].preds.iter().all(|q| !reachable(*q) || body.contains(q))
+            && body.iter().any(|&b| (succs[b].contains(&e) || succs[b].contains(&h)) && per_lane(b))
+        {
+            let mut written = HashSet::new();
+            for &b in &body {
+                let block = &p.blocks[b];
+                let phis = block.phis.iter().map(|phi| (phi.reg, phi.value));
+                let writes = block.insts.iter().flat_map(|i| i.writes.iter().copied());
+                written.extend(phis.chain(writes).filter(|&(r, _)| scalar(r)).map(|(_, v)| v));
+            }
+            let mut after = Vec::new();
+            let mut seen = HashSet::new();
+            for &b in order.iter().filter(|b| !body.contains(b)) {
+                let block = &p.blocks[b];
+                let reads = block
+                    .insts
+                    .iter()
+                    .flat_map(|i| i.reads.iter().map(|r| r.1))
+                    .chain(block.phis.iter().flat_map(|phi| phi.args.iter().copied()));
+                for v in reads {
+                    if written.contains(&v) && seen.insert(v) {
+                        after.push(v);
+                    }
+                }
+            }
+            if !after.is_empty() {
+                exits.entry(e).or_insert_with(Vec::new).push((h, after));
+            }
+        }
+        bodies.insert(h, body);
+    }
+    (exits, bodies)
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1863,6 +1959,7 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        let (loop_exits, loop_bodies) = loop_exits(p, x.st);
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1870,7 +1967,12 @@ impl<'a> Lower<'a> {
             // Code reading other lanes needs the console's wave size and
             // lane order; so do lane masks read as numbers, and LDS shared
             // within one wave, where the console compiler leaves out barriers.
-            console_lanes = insts().any(|i| {
+            // So do scalars a loop writes and code after it reads (`leave_loops`: the wave's
+            // last iteration's values), where a host wave can be a console wave.
+            // shortcut: on a host of 32-lane waves a console wave64 program keeps each
+            // lane's own values there.
+            let loop_scalars = !loop_exits.is_empty() && !(x.native.wave64 && host_max_wave() == 32);
+            console_lanes = loop_scalars || insts().any(|i| {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
@@ -2191,6 +2293,9 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            loop_exits,
+            loop_bodies,
+            finals: HashMap::new(),
             abort: None,
         }
     }
@@ -2871,6 +2976,7 @@ impl<'a> Lower<'a> {
                 };
                 self.vals.insert(phi.value, val);
             }
+            self.leave_loops(b);
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].0) {
                 self.lds_meeting();
             }
@@ -3158,6 +3264,9 @@ impl<'a> Lower<'a> {
             self.read_phis.insert(v);
         }
         let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
+        if let Some(val) = self.final_at(v, self.cur_ir) {
+            return Ok(val);
+        }
         match self.vals.get(&v) {
             Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
                 return self.mask_dword(v).map(Val::I32);
@@ -13572,6 +13681,88 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// `v` as the wave's last iteration of a divergent loop left it, read in IR block `at`
+    /// outside that loop ([`Self::leave_loops`]).
+    fn final_at(&self, v: Value, at: usize) -> Option<Val> {
+        let &(val, h) = self.finals.get(&v)?;
+        (!self.loop_bodies[&h].contains(&at)).then_some(val)
+    }
+
+    /// Entering `b`, the block lanes leave divergent loops through: the scalar values those
+    /// loops wrote, as the wave's last iteration left them. The console runs a divergent loop
+    /// until its last lane leaves, with one set of scalar registers, so afterwards every lane
+    /// reads the last iteration's scalars; here each lane leaves with those of its own last
+    /// iteration. The lanes that ran the most iterations (the loop's [`LOOP_LIMIT`] counter)
+    /// hold the wave's (a scalar is the same in all of them). Only where the host's waves are
+    /// the console's (`console_lanes`, no halves).
+    // shortcut: a value lowered after this block (a loop block later in reverse postorder)
+    // keeps each lane's own.
+    fn leave_loops(&mut self, b: usize) {
+        if self.mask_data != MaskData::Console
+            || !self.console_lanes
+            || self.exchange.is_some()
+            || self.halves.is_some()
+        {
+            return;
+        }
+        let Some(loops) = self.loop_exits.get(&b).cloned() else {
+            return;
+        };
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let (umax, unsigned, zero) = (self.s.m.i8(3), self.s.m.i8(1), self.s.m.i32(0));
+        let wave_max = |l: &mut Self, x: V| {
+            l.s.op(c, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[x, umax, unsigned])
+        };
+        self.s.flags |= flags::WAVE_OPS;
+        for (h, values) in loops {
+            let (count, _) = self.counters[&h];
+            let last = wave_max(self, count);
+            let mine = self.s.m.cmp(c, pred::EQ, count, last);
+            let final_of = |l: &mut Self, val: Val| -> Option<Val> {
+                Some(match val {
+                    Val::I32(x) => {
+                        let x = l.s.m.select(c, mine, x, zero);
+                        Val::I32(wave_max(l, x))
+                    }
+                    Val::Bit(x) => {
+                        let x = l.s.m.cast(c, Cast::ZExt, x, i32t);
+                        let x = l.s.m.select(c, mine, x, zero);
+                        let w = wave_max(l, x);
+                        Val::Bit(l.s.m.cmp(c, pred::NE, w, zero))
+                    }
+                    Val::Missing(_) => return None,
+                })
+            };
+            let st = self.x.st;
+            for v in values {
+                // (lane masks are the lanes' booleans, not these numbers)
+                if st.masks.contains_key(&v) || st.highs.contains_key(&v) {
+                    continue;
+                }
+                // (an inner loop's value as its own exit left it)
+                let Some(val) = self.final_at(v, b).or_else(|| self.vals.get(&v).copied()) else {
+                    continue;
+                };
+                if let Some(f) = final_of(self, val) {
+                    self.finals.insert(v, (f, h));
+                }
+            }
+            // This block's joins of the loop's scalars (every edge in is from the loop).
+            for phi in &self.x.p.blocks[b].phis {
+                let scalar = matches!(phi.reg, Reg::S(r) if r != EXEC && r != EXEC + 1) || phi.reg == Reg::Scc;
+                if !scalar || st.masks.contains_key(&phi.value) || st.highs.contains_key(&phi.value) {
+                    continue;
+                }
+                if let Some(val) = self.vals.get(&phi.value).copied()
+                    && let Some(f) = final_of(self, val)
+                {
+                    self.vals.insert(phi.value, f);
+                }
+            }
+        }
+    }
+
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
         let offset = self.x.p.blocks[b]
             .insts
@@ -13816,7 +14007,9 @@ impl<'a> Lower<'a> {
                         self.vals.insert(arg, val);
                     }
                 }
-                let x = match (self.vals.get(&arg).copied(), bit) {
+                // (an edge from outside a loop brings the loop's final value)
+                let looked = self.final_at(arg, q).or_else(|| self.vals.get(&arg).copied());
+                let x = match (looked, bit) {
                     (Some(Val::I32(x)), false) | (Some(Val::Bit(x)), true) => x,
                     (Some(Val::Missing(_)) | None, false)
                         if numbers && self.dead(arg, &mut Vec::new()) =>

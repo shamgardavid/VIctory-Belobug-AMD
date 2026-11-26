@@ -2382,3 +2382,186 @@ fn ds_past_the_program_lds_reads_zero_and_drops_writes() {
         );
     });
 }
+
+/// A compute program of `threads` lanes (console wave64 if `wave64`; thread id in v0, kept
+/// in v10 by `body`) with `body` between the descriptor load and the store of v0 at byte
+/// 4 * thread; the host wave size it asks for and whether it uses wave operations.
+fn build_group_cs(body: &[u32], wave64: bool, threads: u32) -> (HostShader, Option<u32>, bool) {
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(body);
+    words.push(0x3412_1482); // v_lshlrev_b32 v9, 2, v10
+    // buffer_store_dword v0, v9, s[8:11], 0 offen
+    words.extend_from_slice(&[0x38 << 26 | 0x1C << 18 | 1 << 12, 0x80 << 24 | (8 >> 2) << 16 | 9]);
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs: 16,
+        layout: vec![
+            RootParam {
+                root: RootType::Constants,
+                table_offset_dwords: 0,
+                sgprs: 4,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            },
+            RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 4,
+                slot: 1,
+            },
+        ],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }],
+        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [threads, 1, 1] }),
+        code,
+    };
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let lowered = lower::lower(&lower::Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        io: &io,
+        res: &res,
+        inputs: Vec::new(),
+        outputs: Vec::new(),
+        prims: Vec::new(),
+        mesh_stride: 0,
+    })
+    .expect("lower");
+    let (wave, wave_ops) = (lowered.wave_size, lowered.wave_ops);
+    let shader = HostShader {
+        stage: HwStage::Cs,
+        dxil: lowered.dxil,
+        user_data: lowered.user_data,
+        samplers: lowered.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: lowered.root_cbvs,
+        root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        root_indexed_views: res.root_indexed_views,
+    };
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    (shader, wave, wave_ops)
+}
+
+/// Runs `shader` over one group on the hardware adapter: the first 64 dwords it stores.
+/// (WARP's waves are 4 lanes: it cannot take the console's wave size.)
+fn run_lanes(shader: &HostShader) -> Vec<u32> {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let host = Host::new(false).expect("an SM 6.6 card");
+    let (root, pso) = host.compute_pipeline(shader).expect("pipeline");
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch");
+    out[0][..64].to_vec()
+}
+
+/// Lane i loops i + 1 times, adding 1 to s6 each iteration; s6 is stored after the loop.
+/// `wave64`: the exit mask in s[2:3], else in s2.
+fn divergent_count(wave64: bool) -> [u32; 12] {
+    let (mov, or, andn2, restore) = if wave64 {
+        (0xBE82_0480, 0x8882_026A, 0x8AFE_027E, 0x88FE_027E)
+    } else {
+        (0xBE82_0380, 0x8802_026A, 0x8A7E_027E, 0x887E_027E)
+    };
+    [
+        0x7E14_0300, // v_mov_b32 v10, v0 (thread id kept)
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        mov,         // s_mov_b64 s[2:3], 0 / s_mov_b32 s2, 0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0x8106_8106, // loop: s_add_u32 s6, s6, 1
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        or,          // s_or_b64 s[2:3], vcc, s[2:3] / s_or_b32 s2, vcc_lo, s2
+        andn2,       // s_andn2 exec, exec, s[2:3]
+        0xBF89_FFFA, // s_cbranch_execnz loop
+        restore,     // s_or exec, exec, s[2:3]
+        0x7E00_0206, // v_mov_b32 v0, s6
+    ]
+}
+
+const NESTED: [u32; 23] = [
+    0x7E14_0300, 0x3602_0083, 0x4A02_0281, 0x2C08_0084, 0x4A08_0881, 0xBE86_0380,
+    0xBE82_0480, 0xBE8C_0480, 0x7E06_0304, 0x8106_8106, 0x4E06_0681, 0x7D84_0680,
+    0x888C_0C6A, 0x8AFE_0C7E, 0xBF89_FFFA, 0x88FE_0C7E, 0x4E02_0281, 0x7D84_0280,
+    0x8882_026A, 0x8AFE_027E, 0xBF89_FFF2, 0x88FE_027E, 0x7E00_0206,
+];
+
+/// A scalar counted in a divergent loop and read after it (Belobug/VIctory-Belobug-AMD#352)
+/// is taken from the wave's last iteration: the program asks for the console's wave size
+/// (it reads no other lane, so nothing else would) and reduces over the wave.
+#[test]
+fn scalars_read_after_a_divergent_loop_ask_for_the_console_wave() {
+    for (body, wave64, wave) in [
+        (&divergent_count(true)[..], true, 64),
+        (&divergent_count(false)[..], false, 32),
+        (&NESTED[..], true, 64),
+    ] {
+        let (_, size, wave_ops) = build_group_cs(body, wave64, 64);
+        assert_eq!(size, Some(wave), "the console's wave size");
+        assert!(wave_ops, "the wave's last iteration taken by a wave operation");
+    }
+}
+
+/// The console runs the loop until its last lane leaves, with one s6 for the wave, so every
+/// lane reads the wave's 64 iterations, not its own i + 1.
+#[test]
+#[ignore = "runs on the card: cargo test -p victory-shader --lib -- --ignored scalar_counted"]
+fn scalar_counted_in_a_divergent_loop_read_after_it() {
+    let (shader, _, _) = build_group_cs(&divergent_count(true), true, 64);
+    let got = run_lanes(&shader);
+    assert!(got.iter().all(|&x| x == 64), "iterations counted: {got:?}");
+}
+
+/// The same in wave32 with 64 threads: two console waves, 32 and 64 iterations.
+#[test]
+#[ignore = "runs on the card: cargo test -p victory-shader --lib -- --ignored scalar_counted"]
+fn scalar_counted_in_a_wave32_divergent_loop_read_after_it() {
+    let (shader, _, _) = build_group_cs(&divergent_count(false), false, 64);
+    let got = run_lanes(&shader);
+    assert!(
+        got[..32].iter().all(|&x| x == 32) && got[32..].iter().all(|&x| x == 64),
+        "iterations counted: {got:?}"
+    );
+}
+
+/// Nested divergent loops adding to one s6 (main's test of the same name): every lane reads
+/// the wave's 16.
+#[test]
+#[ignore = "runs on the card: cargo test -p victory-shader --lib -- --ignored scalar_counted"]
+fn scalar_counted_in_nested_divergent_loops() {
+    let (shader, _, _) = build_group_cs(&NESTED, true, 64);
+    let got = run_lanes(&shader);
+    assert!(got.iter().all(|&x| x == 16), "iterations counted: {got:?}");
+}
