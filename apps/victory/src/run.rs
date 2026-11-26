@@ -234,6 +234,14 @@ pub fn run(
         // SAFETY: the image stays mapped and nothing of it has run yet.
         unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
     }
+    // The title's hang watchdog (VICTORY_HANG_WATCHDOG_S, off without it):
+    // a frame of more than 30 s is a GPU lockup to it (#344).
+    #[cfg(windows)]
+    if execute {
+        let size = image.info().size_of_image as usize;
+        // SAFETY: the image stays mapped and nothing of it has run yet.
+        unsafe { victory_loader::hang_watchdog::apply_asked(hash.as_str(), image.base(), size) };
+    }
     if !execute {
         println!("not executing (pass --execute to start the title)");
         return Ok(());
