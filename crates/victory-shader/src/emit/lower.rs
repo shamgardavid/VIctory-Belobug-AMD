@@ -8492,23 +8492,51 @@ impl<'a> Lower<'a> {
     /// The host's word for the buffer view `src` names: its stride and
     /// format kind ([`super::shader::SLOT_STRIDES`]).
     fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
-        let Source::Loaded { load, first } = src else {
-            return Ok(None);
+        let heap = |l: &Self, load: &Site| {
+            l.scalar
+                .get(load)
+                .and_then(|a| l.x.native.layout.get(a.param))
+                .is_some_and(|p| p.root == RootType::ResourceHeap)
         };
-        let heap = self
-            .scalar
-            .get(load)
-            .and_then(|a| self.x.native.layout.get(a.param))
-            .is_some_and(|p| p.root == RootType::ResourceHeap);
-        if !heap {
+        let Source::Loaded { load, first } = src else {
+            // A view picked from the heap per lane or by SCC (each choice one from the
+            // heap): its slot as the lane's descriptor has it.
+            fn no_phi(s: &Source) -> bool {
+                match s {
+                    Source::Phi { .. } => false,
+                    Source::Select { args, .. } | Source::Lanes { args, .. } => args.iter().all(no_phi),
+                    Source::LanePhi { args, .. } => args.iter().flatten().all(no_phi),
+                    _ => true,
+                }
+            }
+            let leaves = src.leaves();
+            let picked = no_phi(src)
+                && !leaves.is_empty()
+                && leaves.iter().all(|l| {
+                    matches!(l, Source::Loaded { load, .. } | Source::Fetched { load, .. } if heap(self, load))
+                });
+            if !picked {
+                return Ok(None);
+            }
+            let slot = self.lane_heap_index(src, false)?;
+            return Ok(Some(self.slot_word_at(slot)));
+        };
+        if !heap(self, load) {
             return Ok(None);
         }
         let key = (self.cur, *load, *first);
         if let Some(&v) = self.strides.get(&key) {
             return Ok(Some(v));
         }
-        let c = self.cur;
         let slot = self.heap_index(*load, *first, false)?;
+        let v = self.slot_word_at(slot);
+        self.strides.insert(key, v);
+        Ok(Some(v))
+    }
+
+    /// The host's word for heap slot `slot` ([`super::shader::SLOT_STRIDES`]).
+    fn slot_word_at(&mut self, slot: V) -> V {
+        let c = self.cur;
         // Inside the table whatever the index (lanes that do not run
         // compute one too): a root view has no bounds of its own.
         let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
@@ -8530,9 +8558,7 @@ impl<'a> Lower<'a> {
             &[h, byte, iu, mask, align],
         );
         let f = self.s.m.extract(c, r, 0);
-        let v = self.as_int(f);
-        self.strides.insert(key, v);
-        Ok(Some(v))
+        self.as_int(f)
     }
 
     /// The heap index of a descriptor that may differ between lanes,
@@ -12778,26 +12804,36 @@ impl<'a> Lower<'a> {
         // element's byte. (Also tells the host this shader reads such
         // buffers.)
         let mut index = index;
-        if let Some(stride) = self.slot_stride(src)?
-            && let Some(element) = index
+        if let Some(element) = index
             && !typed
             && used.is_none()
+            && let Some(stride) = self.slot_stride(src)?
         {
             let at = self.s.m.bin(c, Bin::Mul, element, stride);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
         }
-        // A structured buffer by its used-resource entry's stride: raw
+        // A structured buffer by its used-resource entry's stride, or by the
+        // one in dword 1 of a descriptor the program builds around a root
+        // address (or holds in its code), which the entry may lack: raw
         // bytes too. The host makes its buffer views raw (a raw read
         // through a structured view gives zeros on NVIDIA), and one kind
         // of view can then serve every shader that reads the buffer.
-        if let (Some(element), Some(u)) = (index, used)
+        let stride = match used.map_or(0, |u| u.stride) {
+            s if s >= 4 && s.is_multiple_of(4) => s,
+            _ => match src {
+                Source::Built { bits, .. } => bits >> 16 & 0x3FFF,
+                Source::Constant(words) => words.get(1).map_or(0, |w| w >> 16 & 0x3FFF),
+                _ => 0,
+            },
+        };
+        if let Some(element) = index
             && !typed
-            && u.kind != ResourceType::Cbv
-            && u.stride >= 4
-            && u.stride.is_multiple_of(4)
+            && used.is_none_or(|u| u.kind != ResourceType::Cbv)
+            && stride >= 4
+            && stride.is_multiple_of(4)
         {
-            let k = self.s.m.i32(u.stride);
+            let k = self.s.m.i32(stride);
             let at = self.s.m.bin(c, Bin::Mul, element, k);
             off = self.s.m.bin(c, Bin::Add, at, off);
             index = None;
@@ -14191,6 +14227,85 @@ mod tests {
             let words = [0xD400_0000 | op << 16, 0x101 | 0x102 << 9 | 0x103 << 18];
             lowers_valu(&words).unwrap_or_else(|e| panic!("VOP3 {op:#x}: {e}"));
         }
+    }
+
+    /// A structured buffer read by element through a descriptor built around a root
+    /// descriptor's address, whose used-resource entry has no stride: the stride is the one
+    /// the code ORs into dword 1 (Marvisak/VIctory#3366). Without one it stays unknown.
+    #[test]
+    fn a_root_built_buffer_read_by_element_takes_the_stride_of_its_dword_1() {
+        let program = |stride: u32| {
+            vec![
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF408_0201, // s_load_dwordx4 s[8:11], s[2:3], 0 (the table's UAV)
+                0xFA00_0000,
+                0x8801_FF01, // s_or_b32 s1, s1, stride << 16
+                stride << 16,
+                0xBE82_03C1, // s_mov_b32 s2, -1
+                0xBE83_03FF, // s_mov_b32 s3, 0x11014fac
+                0x1101_4FAC,
+                0xE030_2000, // buffer_load_dword v1, v0, s[0:3], 0 idxen
+                0x8000_0100,
+                0xE070_0000, // buffer_store_dword v1, off, s[8:11], 0
+                0x8002_0100,
+                S_ENDPGM,
+            ]
+        };
+        let used = |kind, root, user_data, slot| UsedResource {
+            kind,
+            root,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data,
+            slot,
+        };
+        let lowered = |stride| {
+            lower_with(
+                &program(stride),
+                vec![root(RootType::Descriptor, 0, 0), root(RootType::Table, 2, 1)],
+                vec![
+                    used(ResourceType::Srv, RootType::Descriptor, 0, 0),
+                    used(ResourceType::Uav, RootType::Table, 2, 1),
+                ],
+            )
+        };
+        lowered(16).unwrap_or_else(|e| panic!("stride 16: {e}"));
+        let unknown = lowered(0).map(|_| ()).unwrap_err().to_string();
+        assert!(unknown.contains("unknown stride"), "stride 0: {unknown}");
+    }
+
+    /// A buffer read by element through one of two views picked from the heap by SCC: the
+    /// stride is the host's for the slot the lane's descriptor names, as for one view.
+    #[test]
+    fn a_heap_view_picked_by_scc_read_by_element_takes_its_slots_stride() {
+        let words = [
+            0xBE84_0301, // s_mov_b32 s4, s1 (the heap)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202, // s_load_dwordx4 s[8:11], s[4:5], 0
+            0xFA00_0000,
+            0xF408_0302, // s_load_dwordx4 s[12:15], s[4:5], 32
+            0xFA00_0020,
+            0xF408_0502, // s_load_dwordx4 s[20:23], s[4:5], 64
+            0xFA00_0040,
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0x8510_0C08, // s_cselect_b32 s16, s8, s12
+            0x8511_0D09, // s_cselect_b32 s17, s9, s13
+            0x8512_0E0A, // s_cselect_b32 s18, s10, s14
+            0x8513_0F0B, // s_cselect_b32 s19, s11, s15
+            0xE030_2000, // buffer_load_dword v1, v0, s[16:19], 0 idxen
+            0x8004_0100,
+            0xE070_0000, // buffer_store_dword v1, off, s[20:23], 0
+            0x8005_0100,
+            S_ENDPGM,
+        ];
+        lower_with(
+            &words,
+            vec![root(RootType::Constants, 0, 0), root(RootType::ResourceHeap, 1, 1)],
+            vec![],
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
     }
 
     #[test]
