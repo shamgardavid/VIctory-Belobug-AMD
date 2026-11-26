@@ -733,6 +733,22 @@ pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 
+/// Whether a slot whose looks ([`RECHECK_FRAMES`]) all found it unchanged
+/// is still looked at, at the last wait each time (`VICTORY_RECHECK_ENDLESS=0`:
+/// no, it is done after the fifth, as before). Belobug #337: changes made
+/// after the fifth look (576 frames after the upload) were never seen.
+fn recheck_endless() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_ENDLESS").is_none_or(|v| v != "0"))
+}
+
+/// The wait before the look that follows `looks` unchanged ones; `None`:
+/// no more looks (`endless` off, past the last).
+fn next_look(looks: u8, endless: bool) -> Option<u64> {
+    let last = RECHECK_FRAMES[RECHECK_FRAMES.len() - 1];
+    RECHECK_FRAMES.get(usize::from(looks) + 1).copied().or(endless.then_some(last))
+}
+
 /// Looks at uploaded textures picked by index that found the memory as it
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -2445,10 +2461,16 @@ impl State {
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
-                    match RECHECK_FRAMES.get(usize::from(looks) + 1) {
-                        Some(wait) => {
-                            host.texture_slot_recheck(index, write, frame + wait, (at, len), print, looks + 1, uploaded)
-                        }
+                    match next_look(looks, recheck_endless()) {
+                        Some(wait) => host.texture_slot_recheck(
+                            index,
+                            write,
+                            frame + wait,
+                            (at, len),
+                            print,
+                            looks.saturating_add(1),
+                            uploaded,
+                        ),
                         None => host.texture_slot_done(index, write, None),
                     }
                     continue;
@@ -4708,7 +4730,19 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::staging_budget_per_frame;
+    use super::{next_look, staging_budget_per_frame};
+
+    /// Belobug #337: the looks at a texture picked by index go on past the
+    /// fifth, every 400 frames, unless asked to end.
+    #[test]
+    fn heap_texture_looks_go_on_after_the_last_wait() {
+        let waits: Vec<_> = (0..4).map(|looks| next_look(looks, true)).collect();
+        assert_eq!(waits, [Some(12), Some(40), Some(120), Some(400)]);
+        assert_eq!(next_look(4, true), Some(400));
+        assert_eq!(next_look(u8::MAX, true), Some(400));
+        assert_eq!(next_look(3, false), Some(400));
+        assert_eq!(next_look(4, false), None);
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
