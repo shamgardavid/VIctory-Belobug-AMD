@@ -117,3 +117,54 @@ Kept up to date during the investigation. Newest findings at the end of each sec
   0x817, `platform:/levels/americas/map/powergrids.zmt`); WARP passes Legal Notices;
   ZSayerHQ/victory-world-runtime is said to reach the world on RDNA3/RTX30+/5090.
 - Fork survey in progress (fixes for the loader hang, AMD RDNA3 world runs, speed).
+
+## A full copy, then in-world (2026-11-26, evening)
+
+- The user copied the whole game folder again, to `D:\GTA 6 game files\GTA 6\GTA6`
+  (kept as the backup) and over `Grand Theft Auto VI (fixed)` on C:. Only
+  `story000.rpf` differed in size (now 20,022,508,672 bytes); no file is wrapped any
+  more. The folder from the Xbox has no `game_scarlett_master.exe`: copy the untouched
+  one beside it (BLAKE3 `b99f876b…`).
+- With it the title loaded the story and ran ~3 minutes at 0.3 fps (3.5 s frames,
+  copies ~0.7 s), then ended itself: `0xc0000005` writing 0 at `+0x23cf683`. That is a
+  deliberate fatal routine (`+0x23cf620`): it decodes a 12-byte string
+  (`out[i] = in[i] + (12 - i)` over `3B 45 4B 17 44 68 5D 1B 4F 66 65 FF`) to
+  **"GPU Loc Sig"** and writes `0x4D8BD421` to address 0: the title's GPU-lockup
+  watchdog. Same as Belobug/VIctory-Belobug-AMD#344.
+
+## Branch `rx9070xt-speed` (Belobug `rx9070xt` + ours)
+
+- Belobug's `rx9070xt` branch was rebased away from `main`/Marvisak (589 commits we
+  lacked, 57 conflicts on merge), so `rx9070xt-speed` starts from it and re-applies only
+  our monitor, pads-at-rest, stack-dump and notes commits; the wrapped-file support was
+  dropped (the files are clean now). `VICTORY_KEYS_FILE` was ported (it lives on
+  Belobug `main` only).
+- Shaders: `victory shaders <game dir>` translated 25,790 shaders in ~3.5 minutes (195
+  "containers without a program" are not shaders); before, the cache held 1,438.
+  `VICTORY_PORT_CBV=1` is part of the cache key: translate with the switch you play with.
+- Pipelines: `victory warm` needs `known-pipelines.bin`, written only by runs with
+  `VICTORY_PIPELINE_BOOK=1`; one ~15 minute session recorded 83,594.
+- Run: play.ps1's switches + `VICTORY_PORT_CONSTANTS/DESCRIPTORS/CBV/GUARD/JOURNAL=1`,
+  `VICTORY_RESIDENCY=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `--console series-s`.
+  Result: boots to the start screen, the opening cutscenes and gameplay. Loading
+  ~3 fps (copies 10 ms instead of 700 ms); in the world 13–21 fps, dropping to ~3 fps
+  while new pipelines are made (their draws are dropped meanwhile, so the picture fills
+  in over time). Memory commit ~22 GB. No shader failed to translate.
+- Picture still wrong: dark brown haze, horizontal streaks, speckled surfaces.
+- Where a world frame goes (copystat, ~47–75 ms): watches ~15 ms checking ~4 GB of which
+  ~3.96 GB is unchanged; guard-lock waits ~45 ms summed over threads; ~10,000 page
+  faults; copies 12–24 ms; ~15 ms waiting for pipelines.
+- The title's memory flags (`note_protection`): CPU+GPU read-write `0x2004` ~4 GB;
+  write-combined CPU+GPU `0x2404` ~3 GB; coherent `0x22004` ~1.4 GB; CPU-only `0x4`
+  ~16.6 GB. **Nothing is GPU-read-only**, so "upload once, never check" by flag does not
+  apply; write-combined memory is the candidate for being read in place.
+- A later boot (terms accepted) goes straight to the start screen; press A (Enter).
+  "title suspended; ending the title" = the window was closed/minimised, not a crash.
+
+## Leads (evening)
+
+- Subagents on branches: `picture-fixes` (Marvisak commits missing from rx9070xt),
+  `fix-344-gpu-watchdog`, `fix-350-337`, `fix-shader-352-3366`, `fix-355-skinning`;
+  PS4/PS5 pads merged (`playstation.rs`); a fork survey.
+- Memory hints: route write-combined (`0x400`) title memory to `inplace::place_for`;
+  per-flag-class tallies of checked/copied bytes in copystat first.
