@@ -1114,7 +1114,8 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// Host input: XInput pads, the keyboard while our process has focus.
+/// Host input: XInput pads (and one PlayStation pad over HID), the keyboard
+/// while our process has focus.
 #[cfg(windows)]
 mod host {
     use std::time::{Duration, Instant};
@@ -1189,18 +1190,36 @@ mod host {
             if *NO_PADS.get_or_init(|| std::env::var_os("VICTORY_NO_PADS").is_some()) {
                 return None;
             }
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
+            let mut xinput = None;
+            if !self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
+                let mut state = XINPUT_STATE::default();
+                // SAFETY: room for the state.
+                if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
+                    self.empty_until[slot] = None;
+                    xinput = Some(convert(&state.Gamepad));
+                } else {
+                    self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                }
             }
-            let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
-            }
-            self.empty_until[slot] = None;
+            // A DualShock 4 or DualSense is a HID device, not an XInput one;
+            // it plays slot 0 when no XInput pad answers there.
             #[allow(unused_mut)]
-            let mut pad = convert(&state.Gamepad);
+            let mut pad = match xinput {
+                Some(pad) => pad,
+                None if slot == 0 => {
+                    let r = super::super::playstation::latest()?;
+                    PadState {
+                        buttons: r.buttons,
+                        left_trigger: r.left_trigger,
+                        right_trigger: r.right_trigger,
+                        left_x: r.left_x,
+                        left_y: r.left_y,
+                        right_x: r.right_x,
+                        right_y: r.right_y,
+                    }
+                }
+                None => return None,
+            };
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
