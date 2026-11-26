@@ -3589,6 +3589,12 @@ pub fn title_memory_remapping() -> Remapping {
 /// away or makes, even for a moment (the rest of a view unmapped and mapped
 /// again), must be in `ranges`.
 pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
+    title_memory_remapping_with(|| ranges)
+}
+
+/// As [`title_memory_remapping_in`], but only collect the affected ranges
+/// when the range lock will use them. The whole-space lock needs none.
+pub fn title_memory_remapping_with<R: AsRef<[(usize, usize)]>>(ranges: impl FnOnce() -> R) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3600,7 +3606,7 @@ pub fn title_memory_remapping_in(ranges: &[(usize, usize)]) -> Remapping {
         }
     }
     let changing = if fine::on() {
-        Changing::Fine(fine::FINE.write(ranges))
+        Changing::Fine(fine::FINE.write(ranges().as_ref()))
     } else {
         Changing::Whole(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
     };
@@ -5509,6 +5515,17 @@ mod fine_tests {
         reader.join().unwrap();
         assert!(!early, "a reader of [5000, 6000) went on during an unranged change");
         assert!(after, "a reader of [5000, 6000) never went on after the unranged change");
+    }
+
+    #[test]
+    fn remapping_only_collects_ranges_when_using_the_range_lock() {
+        let mut collections = 0;
+        let changing = super::title_memory_remapping_with(|| {
+            collections += 1;
+            [(0x1000, 0x2000)]
+        });
+        drop(changing);
+        assert_eq!(collections, usize::from(super::fine::on()));
     }
 
     /// The entry points follow the switch: a change of mapping excludes a read

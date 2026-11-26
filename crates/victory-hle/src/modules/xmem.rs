@@ -1212,8 +1212,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
-    let ranges = [affected(&physical, base, n * PAGE)];
-    let _changing = victory_gpu::title_memory_remapping_in(&ranges);
+    let _changing = victory_gpu::title_memory_remapping_with(|| [affected(&physical, base, n * PAGE)]);
     unmap(&mut physical, base, n * PAGE);
     let Some(pages) = pages else {
         return address;
@@ -1297,8 +1296,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let _busy = Busy::begin();
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
-    let ranges = [affected(&physical, to, len)];
-    let _changing = victory_gpu::title_memory_remapping_in(&ranges);
+    let _changing = victory_gpu::title_memory_remapping_with(|| [affected(&physical, to, len)]);
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -1351,8 +1349,7 @@ pub fn map_aliases(ranges: &[(u64, u64, u64)]) -> bool {
             ops.push(Op::new(to, slice.flatten()));
             at += 1;
         }
-        let ranges = affected_ops(&physical, &ops);
-        let _changing = victory_gpu::title_memory_remapping_in(&ranges);
+        let _changing = victory_gpu::title_memory_remapping_with(|| affected_ops(&physical, &ops));
         ok &= change(&mut physical, ops);
     }
     ok
@@ -1390,8 +1387,7 @@ fn scatter(wanted: &[(usize, usize)]) -> bool {
         if let Some(costed) = &mut costed {
             costed.pages = Some(ops.len());
         }
-        let ranges = affected_ops(&physical, &ops);
-        let _changing = victory_gpu::title_memory_remapping_in(&ranges);
+        let _changing = victory_gpu::title_memory_remapping_with(|| affected_ops(&physical, &ops));
         ok &= change(&mut physical, ops);
     }
     ok
